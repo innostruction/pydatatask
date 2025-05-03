@@ -46,6 +46,7 @@ dependencies = [
     "jq",
     "janus",
     "aiojobs",
+    "pygraphviz"
 ]
 
 [project.scripts]

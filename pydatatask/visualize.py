@@ -425,6 +425,6 @@ def run_viz(pipeline, host, port):
     """
     tv = TaskVisualizer(pipeline)
     try:
-        tv.app.run_server(debug=True, host=host, port=port)
+        tv.app.run(debug=True, host=host, port=port)
     except KeyboardInterrupt:
         pass
