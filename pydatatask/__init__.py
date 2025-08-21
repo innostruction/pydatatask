@@ -9,6 +9,7 @@ from .quota import *
 from .executor import *
 from .host import *
 from . import query
+from .staging import get_current_directory_pipeline
 
 __version__ = "0.4.8-dev.1"
 released_version = "0.4.7"

@@ -52,7 +52,7 @@ from pydatatask.executor.container_set_manager import (
 )
 from pydatatask.executor.pod_manager import PodManager, VolumeSpec, kube_connect
 from pydatatask.host import LOCAL_HOST, Host, HostOS
-from pydatatask.quota import LOCALHOST_QUOTA, Quota
+from pydatatask.quota import LOCALHOST_QUOTA, Quota, QuotaPoolSet, QuotaPool
 from pydatatask.session import Ephemeral, SessionOpenFailedError
 
 from ..utils import (
@@ -190,11 +190,16 @@ class AbstractProcessManager(Executor):
         """
         raise NotImplementedError
 
-    async def kill(self, task: str, job: str, replica: int):
+    async def kill(self, task: str, job: str, replica: int | None):
         """Terminate the process with the given identifier.
 
         This should do nothing if the process is not currently running.
         """
+        if replica is None:
+            basedir = self._basedir / task / job
+            replicas = await self._readdir(basedir)
+            return await asyncio.gather(*(self.kill(task, job, int(x)) for x in replicas))
+
         basedir = self._basedir / task / job / str(replica)
         info_path = basedir / "info"
         async with await self._open(info_path, "rb") as fp:
@@ -401,12 +406,12 @@ class LocalLinuxManager(AbstractProcessManager):
             return self._local_docker_set
         raise TypeError("Not configured to connect to docker (pass nil_ephemeral, lol)")
 
-    def cache_flush(self):
-        super().cache_flush()
+    def cache_flush(self, soft=False):
+        super().cache_flush(soft=soft)
         if self._local_docker is not None:
-            self._local_docker.cache_flush()
+            self._local_docker.cache_flush(soft=soft)
         if self._local_docker_set is not None:
-            self._local_docker_set.cache_flush()
+            self._local_docker_set.cache_flush(soft=soft)
 
     def __init__(
         self,
@@ -622,12 +627,17 @@ class LocalLinuxOrKubeManager(LocalLinuxManager):
             self._local_kube = None
             self._local_kube_set = None
 
-    def cache_flush(self):
-        super().cache_flush()
+    def cache_flush(self, soft=False):
+        super().cache_flush(soft=soft)
         if self._local_kube is not None:
-            self._local_kube.cache_flush()
+            self._local_kube.cache_flush(soft=soft)
         if self._local_kube_set is not None:
-            self._local_kube_set.cache_flush()
+            self._local_kube_set.cache_flush(soft=soft)
+    
+    async def refresh_quota_pools(self):
+        if self._local_kube is not None:
+            await self._local_kube.refresh_quota_pools()
+            self.quota = self._local_kube.quota
 
     def to_pod_manager(self):
         if self._local_kube is not None:

@@ -141,9 +141,9 @@ class FallbackMetadataRepository(MetadataRepository):
         await self.base.delete(job)
         await self.fallback.delete(job)
 
-    def cache_flush(self):
-        self.base.cache_flush()
-        self.fallback.cache_flush()
+    def cache_flush(self, soft=False):
+        self.base.cache_flush(soft=soft)
+        self.fallback.cache_flush(soft=soft)
 
     def footprint(self):
         yield self  # me when I lie

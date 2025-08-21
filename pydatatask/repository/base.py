@@ -1,6 +1,10 @@
 """This module contains repository base classes as well as repository combinators and the simple filesystem
 repositories."""
 
+import contextlib
+import json
+import tempfile
+import time
 from typing import (
     Any,
     AsyncContextManager,
@@ -21,9 +25,10 @@ import io
 import logging
 import os
 import string
-
+import uuid
 import aiofiles.os
 import jsonschema
+import orjson
 import yaml
 
 from .. import repository as repomodule
@@ -42,6 +47,8 @@ from ..utils import (
     roundrobin,
     safe_load,
 )
+
+from datetime import datetime, timedelta
 
 l = logging.getLogger(__name__)
 
@@ -83,10 +90,11 @@ class Repository(ABC):
     def __init__(self):
         self.annotations: Dict[str, str] = {}
         self.compress_backup: bool = False
+        self.__id__ = str(uuid.uuid4())
 
     CHARSET = CHARSET_START_END = string.ascii_letters + string.digits
 
-    def cache_flush(self):
+    def cache_flush(self, soft=False):
         """Flush any in-memory caches held for this repository."""
 
     @abstractmethod
@@ -96,6 +104,7 @@ class Repository(ABC):
 
     @classmethod
     def is_valid_job_id(cls, job: str, /):
+        return True
         """Determine whether the given job identifier is valid, i.e. that it contains only valid characters (numbers
         and letters by default)."""
         return (
@@ -226,6 +235,8 @@ class Repository(ABC):
         if kind == taskmodule.LinkKind.RequestedInput:
             preamble, func = task.mk_download_function(link_name)
             return taskmodule.TemplateInfo(func, preamble=preamble)
+        if kind == taskmodule.LinkKind.Cancel:
+            return taskmodule.TemplateInfo("")
         raise ValueError(f"{type(self)} cannot be templated as {kind} for {task}")
 
     @abstractmethod
@@ -345,10 +356,10 @@ class MapRepository(MetadataRepository):
         for child in self.extra_footprint:
             yield from child.footprint()
 
-    def cache_flush(self):
-        self.base.cache_flush()
+    def cache_flush(self, soft=False):
+        self.base.cache_flush(soft=soft)
         for child in self.extra_footprint:
-            child.cache_flush()
+            child.cache_flush(soft=soft)
 
     def __getstate__(self):
         return (self.base, self.func, self.filter, self.allow_deletes)
@@ -424,10 +435,10 @@ class FilterRepository(Repository):
         for repo in self.extra_footprint:
             yield from repo.footprint()
 
-    def cache_flush(self):
-        self.base.cache_flush()
+    def cache_flush(self, soft=False):
+        self.base.cache_flush(soft=soft)
         for repo in self.extra_footprint:
-            repo.cache_flush()
+            repo.cache_flush(soft=soft)
 
     async def contains(self, item, /):
         if self.filter is None or await self.filter(item):
@@ -592,6 +603,28 @@ class FileRepositoryBase(Repository, ABC):
     async def cache_key(self, job):
         return f"file:{self.basedir}/{job}"
 
+@contextlib.asynccontextmanager
+async def atomically_written_file_via_tmpfile(path, mode):
+    '''
+    Open a tempfile in the given mode and return it instead of the real file. When the context manager
+    exits, move the tempfile to the real path. This should be used for atomic writes.
+
+    This is a context manager, so it should be used with async with. For example:
+
+    async with one_shot_moved_tmpfile('path/to/file', 'w') as fp:
+        await fp.write('data')
+    '''
+
+    assert mode in ('w', 'wb')
+
+    # First, copy the file to a temporary location
+    with tempfile.NamedTemporaryFile(mode=mode, delete=False) as tmp_fp:
+        async with aiofiles.open(tmp_fp.name, mode) as tmp_fp_async:
+            yield tmp_fp_async
+
+    # Then, move the temporary file to the real path
+    await aiofiles.os.rename(tmp_fp.name, path)
+
 
 class FileRepository(FileRepositoryBase, BlobRepository):  # BlobFileRepository?
     """A file repository whose members are files, treated as streamable blobs."""
@@ -603,7 +636,16 @@ class FileRepository(FileRepositoryBase, BlobRepository):  # BlobFileRepository?
     async def open(self, job, mode="r"):
         if not self.is_valid_job_id(job):
             raise KeyError(f"Invalid job id {job} for {self}")
+        if mode in ('w', 'wb'):
+            return atomically_written_file_via_tmpfile(self.fullpath(job), mode)
         return aiofiles.open(self.fullpath(job), mode)  # type: ignore
+
+    def open_sync_for_read(self, job, mode="r"):
+        #if not self.is_valid_job_id(job):
+        #    raise KeyError(f"Invalid job id {job} for {self}")
+        fp = self.fullpath(job)
+        #l.info(f"Opening {fp} for read")
+        return open(fp, mode)
 
     async def delete(self, job, /):
         try:
@@ -626,10 +668,10 @@ class FunctionCallMetadataRepository(MetadataRepository):
         for child in self._extra_footprint:
             yield from child.footprint()
 
-    def cache_flush(self):
-        self._domain.cache_flush()
+    def cache_flush(self, soft=False):
+        self._domain.cache_flush(soft=soft)
         for child in self._extra_footprint:
-            child.cache_flush()
+            child.cache_flush(soft=soft)
 
     async def cache_key(self, job):
         return None
@@ -689,9 +731,9 @@ class RelatedItemRepository(Repository):
         yield from self.base_repository.footprint()
         yield from self.translator_repository.footprint()
 
-    def cache_flush(self):
-        self.base_repository.cache_flush()
-        self.translator_repository.cache_flush()
+    def cache_flush(self, soft=False):
+        self.base_repository.cache_flush(soft=soft)
+        self.translator_repository.cache_flush(soft=soft)
         self.prefetch_lookup = None
 
     def __getstate__(self):
@@ -745,6 +787,10 @@ class RelatedItemRepository(Repository):
 
     async def unfiltered_iter(self):
         base_contents = {x async for x in self.base_repository}
+        # translator_repository_contents = [x async for x in self.translator_repository]
+        # l.warning("RelatedItemRepository: %d items in base, %d items in translator repository, ratio= %.2f",
+        #           len(base_contents), len(translator_repository_contents),
+        #           len(base_contents) / len(translator_repository_contents) if translator_repository_contents else 0)
         async for item in self.translator_repository:
             basename = await self._lookup(item)
             if basename is not None and basename in base_contents:
@@ -819,9 +865,9 @@ class AggregateAndRepository(Repository):
         for child in self.children.values():
             yield from child.footprint()
 
-    def cache_flush(self):
+    def cache_flush(self, soft=False):
         for child in self.children.values():
-            child.cache_flush()
+            child.cache_flush(soft=soft)
 
     async def cache_key(self, job):
         return None
@@ -860,9 +906,9 @@ class AggregateOrRepository(Repository):
         for child in self.children.values():
             yield from child.footprint()
 
-    def cache_flush(self):
+    def cache_flush(self, soft=False):
         for child in self.children.values():
-            child.cache_flush()
+            child.cache_flush(soft=soft)
 
     async def cache_key(self, job):
         return None
@@ -904,9 +950,9 @@ class BlockingRepository(Repository):
         yield from self.source.footprint()
         yield from self.unless.footprint()
 
-    def cache_flush(self):
-        self.source.cache_flush()
-        self.unless.cache_flush()
+    def cache_flush(self, soft=False):
+        self.source.cache_flush(soft=soft)
+        self.unless.cache_flush(soft=soft)
 
     async def cache_key(self, job):
         return await self.source.cache_key(job)
@@ -935,23 +981,33 @@ class BlockingRepository(Repository):
         await self.source.delete(job)
 
 
-class YamlMetadataRepository(MetadataRepository, ABC):
+class CachedSerializedMetadataRepository(MetadataRepository, ABC):
     """A metadata repository based on a blob repository. When info is accessed, it will **load the target file into
     memory**, parse it as yaml, and return the resulting object.
 
     This is a base class, and must be overridden to implement the blob loading portion.
     """
 
-    def __init__(self, blob: BlobRepository):
+    def __init__(self, blob: BlobRepository, deserialize=safe_load, serialize=yaml.safe_dump):
         super().__init__()
         self.blob = blob
+        self.yaml_load_cache = {}
+        self.yaml_load_cache_by_job = {}
+        self._info_all_cache = None
+        self.serialize = serialize
+        self.deserialize = deserialize
 
     # better backup
     def footprint(self):
         yield self
 
-    def cache_flush(self):
-        self.blob.cache_flush()
+    def cache_flush(self, soft=False):
+        self.blob.cache_flush(soft=soft)
+        if not soft:
+            self.yaml_load_cache.clear()
+            self.yaml_load_cache_by_job.clear()
+        # This needs to flush every time because the cache of the entire repository is invalidated
+        self._info_all_cache = None
 
     def __getstate__(self):
         return (self.blob,)
@@ -966,32 +1022,122 @@ class YamlMetadataRepository(MetadataRepository, ABC):
         await self.blob.validate()
         await super().validate()
 
-    @job_getter
-    async def info(self, job, /):
+    async def info_all(self) -> Dict[str, Any]:
+        """Produce a mapping from every job present in the repository to its corresponding info.
+
+        The default implementation is somewhat inefficient; please override it if there is a more effective way to load
+        all info.
+        """
+        #if self._info_all_cache is not None:
+        #    return self._info_all_cache
+
+        USE_SYNC = True
+        jobs = [job async for job in self]
+
+        num_jobs = len(jobs)
+
+        if USE_SYNC and isinstance(self.blob, FileRepository):
+            res = {}
+            if num_jobs > 100:
+                s = time.time()
+            res = {job: self.info_sync(job) for job in jobs}
+            if num_jobs > 100:
+                e = time.time()
+                l.info(f"Loaded {num_jobs} jobs in {e-s} seconds for {self.blob}")
+            #self._info_all_cache = res
+            return res
+
+
+        return {job: await self.info(job) async for job in self}
+
+    def info_sync(self, job):
+        ch = self.yaml_load_cache_by_job.get(job)
+        if ch:
+            return ch
         try:
-            async with await self.blob.open(job, "rb") as fp:
-                s = await fp.read()
+            # always use sync path now
+            with self.blob.open_sync_for_read(job, "rb") as fp:
+                s = fp.read()
         except (LookupError, FileNotFoundError):
             return {}
-        return safe_load(s)
+        
+        if s not in self.yaml_load_cache:
+            start_time = time.time()
+            result = self.deserialize(s)
+            # cache access needs thread safety if shared
+            self.yaml_load_cache[s] = result
+            end_time = time.time()
+            if end_time - start_time > 1:
+                l.warning("Loading %s on %s, %s: took excessively long: %ss > 1s", 
+                        job, self, self.blob, end_time - start_time)
+        else:
+            result = self.yaml_load_cache[s]
+        
+        self.yaml_load_cache_by_job[job] = result
+        return result
+
+    @job_getter
+    async def info(self, job, /):
+        if job in self.yaml_load_cache_by_job:
+            return self.yaml_load_cache_by_job[job]
+        try:
+            #l.info(f"Loading {self.blob} {job}")
+            if isinstance(self.blob, FileRepository):
+                fp = self.blob.open_sync_for_read(job, "rb")
+                s = fp.read()
+                fp.close()
+            else:
+                async with await self.blob.open(job, "rb") as fp:
+                    s = await fp.read()
+        except (LookupError, FileNotFoundError):
+            return {}
+
+        if s not in self.yaml_load_cache:
+            start_time = time.time()
+            self.yaml_load_cache[s] = self.deserialize(s)
+            self.yaml_load_cache_by_job[job] = self.yaml_load_cache[s]
+            end_time = time.time()
+            if end_time - start_time > 1:
+                l.warning("Loading %s on %s, %s: took excessively long: %ss > 1s", job, self, self.blob, end_time - start_time)
+        result = self.yaml_load_cache[s]
+        return result
 
     @job_getter
     async def dump(self, job, data, /):
         self.schema_validate(data)
         if not self.blob.is_valid_job_id(job):
             raise KeyError(job)
-        s = yaml.safe_dump(data, None)
+        s = self.serialize(data)
         async with await self.blob.open(job, "w") as fp:
             await fp.write(s)
 
     async def cache_key(self, job):
         return await self.blob.cache_key(job)
 
+class YamlMetadataRepository(CachedSerializedMetadataRepository):
+    """A metadata repository based on a blob repository, where the blobs are yaml files."""
+    def __init__(self, blob, deserialize=safe_load, serialize=yaml.safe_dump):
+        super().__init__(blob, deserialize, serialize)
+
+
+def serialize_json(s):
+    return orjson.dumps(s).decode('utf-8')
+class JsonMetadataRepository(CachedSerializedMetadataRepository):
+    """A metadata repository based on a blob repository, where the blobs are json files."""
+    def __init__(self, blob, deserialize=safe_load, serialize=serialize_json):
+        super().__init__(blob, deserialize, serialize)
+
 
 class YamlMetadataFileRepository(YamlMetadataRepository):
     """A metadata repository based on a file blob repository."""
 
     def __init__(self, basedir: Union[str, Path], extension: str = ".yaml", case_insensitive: bool = False):
+        super().__init__(FileRepository(basedir, extension=extension, case_insensitive=case_insensitive))
+
+class JsonMetadataFileRepository(JsonMetadataRepository):
+    """A metadata repository based on a file blob repository."""
+
+    def __init__(self, basedir: Union[str, Path], extension: str = ".json", case_insensitive: bool = False):
         super().__init__(FileRepository(basedir, extension=extension, case_insensitive=case_insensitive))
 
 
@@ -1186,8 +1332,8 @@ class CacheInProcessMetadataRepository(MetadataRepository):
     def footprint(self):
         yield from self.base.footprint()
 
-    def cache_flush(self):
-        self.base.cache_flush()
+    def cache_flush(self, soft=False):
+        self.base.cache_flush(soft=soft)
         self._cache = {}
         self._negative_cache = set()
         self._complete_keys = False
@@ -1316,8 +1462,8 @@ class CompressedBlobRepository(BlobRepository):
     def footprint(self):
         yield self
 
-    def cache_flush(self):
-        self.inner.cache_flush()
+    def cache_flush(self, soft=False):
+        self.inner.cache_flush(soft=soft)
 
     async def cache_key(self, job):
         return await self.inner.cache_key(job)

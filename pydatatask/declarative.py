@@ -38,7 +38,7 @@ from pydatatask.query.repository import (
     QueryMetadataRepository,
     QueryRepository,
 )
-from pydatatask.quota import MAX_QUOTA, Quota, _MaxQuotaType
+from pydatatask.quota import MAX_QUOTA, Quota, _MaxQuotaType, _TemplateQuotaType
 from pydatatask.repository import (
     DirectoryRepository,
     DockerRepository,
@@ -52,7 +52,7 @@ from pydatatask.repository import (
     YamlMetadataFileRepository,
     YamlMetadataS3Repository,
 )
-from pydatatask.repository.base import CompressedBlobRepository
+from pydatatask.repository.base import CompressedBlobRepository, JsonMetadataFileRepository
 from pydatatask.repository.filesystem import TarfileFilesystemRepository
 from pydatatask.session import Ephemeral
 from pydatatask.task import (
@@ -62,6 +62,7 @@ from pydatatask.task import (
     LinkKind,
     ProcessTask,
     Task,
+    _TemplateIntType
 )
 import pydatatask
 
@@ -172,7 +173,7 @@ def make_dict_parser(
 
     def inner(thing):
         if not isinstance(thing, dict):
-            raise ValueError(f"{name} must be a dict")
+            raise ValueError(f"{name} must be a dict (got type {type(thing)})")
         return {key_parser(key): value_parser(value) for key, value in thing.items()}
 
     return inner
@@ -286,10 +287,16 @@ def _build_ssh_connection(
 
 quota_constructor_inner = make_constructor("quota", Quota.parse, {"cpu": str, "mem": str})
 
+def max_concurrent_jobs_constructor(thing: Any) -> Union[int, _TemplateIntType]:
+    if isinstance(thing, str):
+        return _TemplateIntType(thing)
+    return int(thing)
 
-def quota_constructor(thing: Any) -> Union[Quota, _MaxQuotaType]:
+def quota_constructor(thing: Any) -> Union[Quota, _MaxQuotaType, _TemplateQuotaType]:
     if thing == "MAX":
         return MAX_QUOTA
+    if isinstance(thing, dict) and thing.get("template", None):
+        return _TemplateQuotaType(thing["template"])
     if thing.get("max", None):
         return _MaxQuotaType(float(thing["max"]))
     return quota_constructor_inner(thing)
@@ -313,6 +320,11 @@ def make_annotated_constructor(
         compress = kwargs.pop("compress_backup", False)
         schema = kwargs.pop("schema", None)
         max_concurrent_jobs = kwargs.pop("max_concurrent_jobs", None)
+        if max_concurrent_jobs is None:
+            max_concurrent_jobs = None # type narrowing
+        else:
+            max_concurrent_jobs = max_concurrent_jobs_constructor(max_concurrent_jobs)
+
         max_spawn_jobs = kwargs.pop("max_spawn_jobs", None)
         max_spawn_jobs_period = kwargs.pop("max_spawn_jobs_period", None)
         require_success = kwargs.pop("require_success", None)
@@ -408,6 +420,15 @@ def build_repository_picker(ephemerals: Mapping[str, Callable[[], Any]]) -> Call
             "YamlFile": make_annotated_constructor(
                 "YamlMetadataFileRepository",
                 YamlMetadataFileRepository,
+                {
+                    "basedir": str,
+                    "extension": str,
+                    "case_insensitive": parse_bool,
+                },
+            ),
+            "JsonFile": make_annotated_constructor(
+                "JsonMetadataFileRepository",
+                JsonMetadataFileRepository,
                 {
                     "basedir": str,
                     "extension": str,
@@ -710,6 +731,9 @@ def build_task_picker(
             "DANGEROUS_filename_is_key": parse_optional_bool,
             "content_keyed_md5": parse_optional_bool,
             "equals": lambda thing: None if thing is None else str(thing),
+            "skip_if_path_exists": lambda thing: None if thing is None else str(thing),
+            "template_cache_key": lambda thing: None if thing is None else str(thing),
+            "use_cache_symlink": lambda thing: False if thing is None else parse_bool(thing),
         },
     )
     links_constructor = make_dict_parser("links", str, link_constructor)
@@ -766,11 +790,11 @@ def build_task_picker(
                 "replicable": parse_bool,
                 "max_replicas": lambda thing: None if thing is None else int(thing),
                 "cache_dir": lambda thing: thing,
-
                 # Process-specific
                 "template": str,
                 "environ": make_dict_parser("environ", str, str),
                 "job_quota": lambda thing: None if thing is None else quota_constructor(thing),
+                "extras": make_dict_parser("extras", str, str),
                 "stdin": make_picker("Repository", repos),
                 "stdout": make_picker("Repository", repos),
                 "stderr": lambda thing: pydatatask.task.STDOUT
@@ -797,9 +821,9 @@ def build_task_picker(
                 "replicable": parse_bool,
                 "max_replicas": lambda thing: None if thing is None else int(thing),
                 "cache_dir": lambda thing: thing,
-
                 # Kube-specific
                 "job_quota": lambda thing: None if thing is None else quota_constructor(thing),
+                "extras": make_dict_parser("extras", str, str),
                 "template": str,
                 "template_env": make_dict_parser("environ", str, str),
                 "logs": make_picker("Repository", repos),
@@ -812,31 +836,44 @@ def build_task_picker(
                 ContainerTask,
                 {
                     # fmt: off
-                # Common to all tasks
-                "name": str,
-                "executor": make_picker("Executor", executors),
-                "done": make_picker("Repository", repos),
-                "ready": make_picker("Repository", repos),
-                "links": links_constructor,
-                "queries": queries_constructor,
-                "timeout": timedelta_constructor,
-                "long_running": parse_bool,
-                "failure_ok": parse_bool,
-                "replicable": parse_bool,
-                "max_replicas": lambda thing: None if thing is None else int(thing),
-                "cache_dir": lambda thing: thing,
-
-                # Container-specific
-                "template": str,
-                "image": str,
-                "environ": make_dict_parser("environ", str, str),
-                "entrypoint": make_list_parser("entrypoint", str),
-                "job_quota": lambda thing: None if thing is None else quota_constructor(thing),
-                "fallback_quota": lambda thing: None if thing is None else quota_constructor(thing),
-                "logs": make_picker("Repository", repos),
-                "privileged": parse_bool,
-                "tty": parse_bool,
-                "mounts": make_dict_parser("mounts", str, str),
+                    # Common to all tasks
+                    "name": str,
+                    "executor": make_picker("Executor", executors),
+                    "done": make_picker("Repository", repos),
+                    "ready": make_picker("Repository", repos),
+                    "links": links_constructor,
+                    "queries": queries_constructor,
+                    "timeout": timedelta_constructor,
+                    "long_running": parse_bool,
+                    "failure_ok": parse_bool,
+                    "replicable": parse_bool,
+                    "scale_replicas": parse_bool,
+                    "starting_replicas": lambda thing: None if thing is None else int(thing),
+                    "replicas_per_minute": lambda thing: None if thing is None else int(thing),
+                    "pod_labels": lambda thing: None if thing is None else make_dict_parser("pod_labels", str, str)(thing),
+                    "node_labels": lambda thing: None if thing is None else make_dict_parser("node_labels", str, str)(thing),
+                    "node_labels_function": lambda thing: None if thing is None else str(thing),
+                    "node_affinity": lambda thing: None if thing is None else make_dict_parser("node_affinity", str, str)(thing),
+                    "node_taints": lambda thing: None if thing is None else make_dict_parser("node_taints", str, str)(thing),
+                    "replica_node_taints": lambda thing: None if thing is None else make_dict_parser("replica_node_taints", str, str)(thing),
+                    "replica_node_labels": lambda thing: None if thing is None else make_dict_parser("replica_node_labels", str, str)(thing),
+                    "replica_node_affinity": lambda thing: None if thing is None else make_dict_parser("replica_node_affinity", str, str)(thing),
+                    "max_replicas": lambda thing: None if thing is None else int(thing),
+                    "cache_dir": lambda thing: thing,
+                    # Container-specific
+                    "template": str,
+                    "image": str,
+                    "environ": make_dict_parser("environ", str, str),
+                    "entrypoint": make_list_parser("entrypoint", str),
+                    "job_quota": lambda thing: None if thing is None else quota_constructor(thing),
+                    "resource_limits": lambda thing: None if thing is None else quota_constructor(thing),
+                    "extras": make_dict_parser("extras", str, str),
+                    "fallback_quota": lambda thing: None if thing is None else quota_constructor(thing),
+                    "logs": make_picker("Repository", repos),
+                    "privileged": parse_bool,
+                    "tty": parse_bool,
+                    "mounts": make_dict_parser("mounts", str, str),
+                    "wait_for_image_pull": lambda thing: False if thing is None else parse_bool(thing)
                     # fmt: on
                 },
             )
@@ -847,31 +884,44 @@ def build_task_picker(
                 ContainerSetTask,
                 {
                     # fmt: off
-                # Common to all tasks
-                "name": str,
-                "executor": make_picker("Executor", executors),
-                "done": make_picker("Repository", repos),
-                "ready": make_picker("Repository", repos),
-                "links": links_constructor,
-                "queries": queries_constructor,
-                "timeout": timedelta_constructor,
-                "long_running": parse_bool,
-                "failure_ok": parse_bool,
-                "replicable": parse_bool,
-                "max_replicas": lambda thing: None if thing is None else int(thing),
-                "cache_dir": lambda thing: thing,
-
-                # Containerset-specific
-                "template": str,
-                "image": str,
-                "environ": make_dict_parser("environ", str, str),
-                "entrypoint": make_list_parser("entrypoint", str),
-                "job_quota": lambda thing: None if thing is None else quota_constructor(thing),
-                "fallback_quota": lambda thing: None if thing is None else quota_constructor(thing),
-                "logs": make_picker("Repository", repos),
-                "privileged": parse_bool,
-                "tty": parse_bool,
-                "mounts": make_dict_parser("mounts", str, str),
+                    # Common to all tasks
+                    "name": str,
+                    "executor": make_picker("Executor", executors),
+                    "done": make_picker("Repository", repos),
+                    "ready": make_picker("Repository", repos),
+                    "links": links_constructor,
+                    "queries": queries_constructor,
+                    "timeout": timedelta_constructor,
+                    "long_running": parse_bool,
+                    "failure_ok": parse_bool,
+                    "replicable": parse_bool,
+                    "scale_replicas": parse_bool,
+                    "starting_replicas": lambda thing: None if thing is None else int(thing),
+                    "replicas_per_minute": lambda thing: None if thing is None else int(thing),
+                    "pod_labels": lambda thing: None if thing is None else make_dict_parser("pod_labels", str, str)(thing),
+                    "node_labels": lambda thing: None if thing is None else make_dict_parser("node_labels", str, str)(thing),
+                    "node_labels_function": lambda thing: None if thing is None else str(thing),
+                    "node_affinity": lambda thing: None if thing is None else make_dict_parser("node_affinity", str, str)(thing),
+                    "node_taints": lambda thing: None if thing is None else make_dict_parser("node_taints", str, str)(thing),
+                    "replica_node_labels": lambda thing: None if thing is None else make_dict_parser("replica_node_labels", str, str)(thing),
+                    "replica_node_taints": lambda thing: None if thing is None else make_dict_parser("replica_node_taints", str, str)(thing),
+                    "replica_node_affinity": lambda thing: None if thing is None else make_dict_parser("replica_node_affinity", str, str)(thing),
+                    "max_replicas": lambda thing: None if thing is None else int(thing),
+                    "cache_dir": lambda thing: thing,
+                    # Containerset-specific
+                    "template": str,
+                    "image": str,
+                    "environ": make_dict_parser("environ", str, str),
+                    "entrypoint": make_list_parser("entrypoint", str),
+                    "job_quota": lambda thing: None if thing is None else quota_constructor(thing),
+                    "resource_limits": lambda thing: None if thing is None else quota_constructor(thing),
+                    "extras": make_dict_parser("extras", str, str),
+                    "fallback_quota": lambda thing: None if thing is None else quota_constructor(thing),
+                    "logs": make_picker("Repository", repos),
+                    "privileged": parse_bool,
+                    "tty": parse_bool,
+                    "mounts": make_dict_parser("mounts", str, str),
+                    "wait_for_image_pull": lambda thing: False if thing is None else parse_bool(thing)
                     # fmt: on
                 },
             )
@@ -889,6 +939,7 @@ def build_task_picker(
         thing.pop("priority")
         thing.pop("priority_factor")
         thing.pop("priority_addend")
+        thing.pop("priority_function")
         executable = thing.pop("executable")
         executable["args"].update(thing)
         executable["args"]["name"] = name

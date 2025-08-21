@@ -52,10 +52,7 @@ class LiveKubeRepository(Repository):
 
     async def delete(self, job, /):
         """Deleting a job from this repository will delete the pods for that job."""
-        pods = await self.task.podman.query(job=job, task=self.task.name)
-
-        for pod in pods:
-            await self.task.podman.delete(pod)
+        await self.task.kill(job, None)
 
 
 class LiveContainerRepository(Repository):
@@ -93,8 +90,7 @@ class LiveContainerRepository(Repository):
 
     async def delete(self, job, /):
         """Deleting a job from this repository will delete the containers for that job."""
-        for jjob, replica in await self.task.manager.live(self.task.name, job):
-            await self.task.manager.kill(self.task.name, jjob, replica)
+        await self.task.kill(job, None)
 
     async def cache_key(self, job):
         return None
@@ -139,8 +135,7 @@ class LiveProcessRepository(Repository):
 
     async def delete(self, job, /):
         """Deleting a job from this repository will delete the processes for that job."""
-        for jjob, replica in await self.task.manager.live(self.task.name, job):
-            await self.task.manager.kill(self.task.name, jjob, replica)
+        await self.task.kill(job, None)
 
 
 class LiveContainerSetRepository(Repository):
@@ -174,5 +169,4 @@ class LiveContainerSetRepository(Repository):
         return f"<LiveContainerSetRepository task={self.task.name}>"
 
     async def delete(self, job, /):
-        for jjob, replica in await self.task.manager.live(self.task.name, job):
-            await self.task.manager.kill(self.task.name, jjob, replica)
+        await self.task.kill(job, None)

@@ -26,6 +26,16 @@ The help screen should look something like this:
 
 from __future__ import annotations
 
+import os
+
+import yaml
+
+yappi = None
+
+if yappi is not None:
+    yappi.set_clock_type("wall") # Use set_clock_type("wall") for wall time
+    yappi.start()
+
 from typing import (
     Callable,
     DefaultDict,
@@ -54,6 +64,9 @@ from aiohttp import web
 from networkx.drawing.nx_pydot import write_dot
 import aiofiles
 import uvloop
+from crs_telemetry.utils import get_otel_tracer, init_otel
+from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
+from opentelemetry.instrumentation.aiohttp_server import AioHttpServerInstrumentor
 
 from . import repository as repomodule
 from . import task as taskmodule
@@ -62,12 +75,17 @@ from .agent import cat_data as cat_data_inner
 from .agent import inject_data as inject_data_inner
 from .pipeline import Pipeline
 from .utils import AsyncQueueStream, async_copyfile
-from .visualize import run_viz
+# from .visualize import run_viz
+from .assets.vizualize import run_viz
 
 try:
     from . import fuse
 except ModuleNotFoundError:
     fuse = None  # type: ignore[assignment]
+
+init_otel("pydatatask", "infra", "pydatatask")
+tracer = get_otel_tracer()
+logging.getLogger("opentelemetry.attributes").disabled = True
 
 log = logging.getLogger(__name__)
 token_re = re.compile(r"\w+(?:\.\w+)+")
@@ -113,6 +131,9 @@ def main(
         "--not-task", "-T", dest="tasks_denylist", action="append", default=[], help="Do not manage these tasks"
     )
     parser.add_argument(
+        "--enable-task-dependencies", dest="enable_task_dependencies", action="store_true", default=False, help="Enable tasks that are not in the allowlist if they are dependencies of other tasks"
+    )
+    parser.add_argument(
         "--debug-trace",
         action="store_true",
         help="Make every worker script print out its execution trace for debugging",
@@ -144,6 +165,16 @@ def main(
     parser_run.add_argument("--launch-once", action="store_true", help="Only evaluates tasks-to-launch once")
     parser_run.set_defaults(func=run)
     parser_run.set_defaults(timeout=None)
+
+    parser_check_templates = subparsers.add_parser("check-templates", help="Check the templates for templating errors")
+    parser_check_templates.add_argument(
+        "--backup-dir",
+        dest="backup_dir",
+        type=Path,
+        help="directory in the backup structure with which template errors should be checked",
+    )
+    parser_check_templates.add_argument("tasks", nargs="*", help="Only look at these tasks")
+    parser_check_templates.set_defaults(func=check_templates)
 
     parser_status = subparsers.add_parser("status", help="View the pipeline status")
     parser_status.add_argument(
@@ -293,6 +324,8 @@ def main(
     parser_http_agent.add_argument("--host", help="The host to listen on", default="0.0.0.0")
     parser_http_agent.add_argument("--override-port", help="The port to listen on", type=int)
     parser_http_agent.add_argument("--flush-seconds", type=int, help="How often to flush the query cache")
+    parser_http_agent.add_argument("--state-dir", type=str, help="For provider cache state / node cache, provide a writeable directory")
+    parser_http_agent.add_argument("--nginx-url", type=str, help="For provider nginx, provide a base url")
 
     parser_http_multi = subparsers.add_parser(
         "agent-http-multi", help="Launch multiple http agents balanced behind nginx"
@@ -323,6 +356,7 @@ def main(
         task_denylist=ns.pop("tasks_denylist") or None,
         debug_trace=ns.pop("debug_trace"),
         require_success=ns.pop("require_success"),
+        enable_task_dependencies=ns.pop("enable_task_dependencies", False),
     )
     pipeline.global_template_env.update(dict([line.split("=", 1) for line in ns.pop("global_template_env") or []]))
     pipeline.global_script_env.update(dict([line.split("=", 1) for line in ns.pop("global_script_env") or []]))
@@ -333,7 +367,11 @@ def main(
     uvloop.install()
 
     if asyncio.iscoroutine(result_or_coro):
-        return asyncio.run(main_inner(pipeline, result_or_coro))
+        if yappi is not None:
+            with yappi.run():
+                return asyncio.run(main_inner(pipeline, result_or_coro))
+        else:
+            return asyncio.run(main_inner(pipeline, result_or_coro))
     else:
         return result_or_coro
 
@@ -378,14 +416,16 @@ async def graph(pipeline: Pipeline, out_dir: Optional[Path]):
         write_dot(pipeline.graph, f)
 
 
+@tracer.start_as_current_span("pydatatask.http_agent")
 def http_agent(
-    pipeline: Pipeline, host: str, override_port: Optional[int] = None, flush_seconds: Optional[float] = None
+    pipeline: Pipeline, host: str, override_port: Optional[int] = None, flush_seconds: Optional[float] = None, state_dir: Optional[str] = None, nginx_url: Optional[str] = None
 ) -> None:
     logging.getLogger("aiohttp.access").setLevel("DEBUG")
-    app = build_agent_app(pipeline, True, None if flush_seconds is None else timedelta(seconds=flush_seconds))
+    app = build_agent_app(pipeline, True, None if flush_seconds is None else timedelta(seconds=flush_seconds), state_dir=state_dir, nginx_url=nginx_url)
     web.run_app(app, host=host, port=override_port or pipeline.agent_port)
 
 
+@tracer.start_as_current_span("pydatatask.http_agent_multi")
 def http_agent_multi(pipeline: Pipeline, host: str, count: int) -> None:
     nginx = shutil.which("nginx")
     if nginx is None:
@@ -457,6 +497,7 @@ http {{
         raise Exception("nginx failed to start")
 
 
+@tracer.start_as_current_span("pydatatask.run")
 async def run(
     pipeline: Pipeline,
     forever: bool,
@@ -488,6 +529,76 @@ def get_links(pipeline: Pipeline, all_repos: bool, tasks: Optional[List[str]]) -
                 continue
             seen.add(id(link))
             yield link
+def get_tasks_and_links(pipeline: Pipeline, all_repos: bool, tasks: Optional[List[str]]) -> Iterable[Tuple[taskmodule.Task, taskmodule.Link]]:
+    seen = set()
+    for task in pipeline.tasks.values():
+        if tasks is not None and task.name not in tasks:
+            continue
+        for link in task.links.values():
+            if not all_repos and not link.is_status and not link.is_input and not link.is_output:
+                continue
+            if id(link) in seen:
+                continue
+            seen.add(id(link))
+            yield task, link
+
+
+async def check_template_templates(template, env):
+    try:
+        await taskmodule.render_template(template, env)
+    except Exception as e:
+        raise ValueError(f"Template {template} has an error: {e}") from e
+
+async def build_task_template_env(task: taskmodule.Task, backup_dir: Optional[Path]=None) -> Dict[str, str]:
+    """Build the template environment for a task."""
+    env = {}
+    pre_env = {}
+    if backup_dir:
+        with open(backup_dir / f"{task.name}.yaml", "r", encoding="utf-8") as f:
+            pre_env.update(yaml.safe_load(f))
+    for link_name, link in task.links.items():
+        if link.kind == taskmodule.LinkKind.InputId:
+            env[link_name] = '01233456789abcdef'
+        elif link.kind == taskmodule.LinkKind.InputMetadata or link.cokeyed:
+            if link_name not in pre_env:
+                env[link_name] = {'task': task.name, 'link': link_name}
+                assert False, f"Link {link_name} for task {task.name} is not in the pre_env, please add it to the backup directory"
+            else:
+                env[link_name] = pre_env[link_name]
+        elif link.kind in (taskmodule.LinkKind.InputFilepath, taskmodule.LinkKind.OutputFilepath):
+            env[link_name] = f'/{str(link.kind)}/'
+        elif link.kind in (taskmodule.LinkKind.StreamingInputFilepath, taskmodule.LinkKind.StreamingOutputFilepath) and link.DANGEROUS_filename_is_key:
+            env[link_name] = {
+                'lock_dir': f'/{str(link.kind)}/lock',
+                'main_dir': f'/{str(link.kind)}/main',
+            }
+        elif link.kind == taskmodule.LinkKind.Cancel:
+            env[link_name] = None
+
+        elif link.kind is None:
+            env[link_name] = None
+        else:
+            assert False, f"Unknown link kind {link.kind} for {task.name}.{link_name}"
+
+    return env
+
+async def check_templates(
+    pipeline: Pipeline,
+    backup_dir: Optional[Path] = None,
+    tasks: Optional[List[str]] = None,
+):
+    tasks = tasks or None
+    for task_name, task in pipeline.tasks.items():
+        if tasks is not None and task_name not in tasks:
+            continue
+        log.info("Checking templates for task %s", task_name)
+        env = await build_task_template_env(task, backup_dir)
+        await check_template_templates(str(task.max_concurrent_jobs), env)
+
+        if isinstance(task, taskmodule.ContainerTask):
+            await check_template_templates(task.template, env)
+        else:
+            assert False, f"Task {task_name} is not a ContainerTask, cannot check templates"
 
 
 async def print_status(
@@ -672,6 +783,7 @@ async def cat_data(pipeline: Pipeline, data: str, job: str):
         return 1
 
 
+@tracer.start_as_current_span("pydatatask.inject_data")
 async def inject_data(pipeline: Pipeline, data: str, job: str):
     item = lookup_dotted(pipeline, data)
     if isinstance(item, taskmodule.Task):
@@ -692,6 +804,7 @@ async def inject_data(pipeline: Pipeline, data: str, job: str):
         return 1
 
 
+@tracer.start_as_current_span("pydatatask.launch")
 async def launch(
     pipeline: Pipeline,
     task_name: str,
@@ -710,6 +823,7 @@ async def launch(
         return 1
 
 
+@tracer.start_as_current_span("pydatatask.action_backup")
 async def action_backup(
     pipeline: Pipeline, backup_dir: str, repos: List[str], all_repos: bool = False, shallow: bool = False
 ):

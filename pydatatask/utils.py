@@ -24,6 +24,7 @@ import pickle
 import struct
 import time
 
+import orjson
 from typing_extensions import Buffer, ParamSpec
 import yaml
 
@@ -597,6 +598,6 @@ def safe_load(x: Union[str, bytes, io.TextIOBase]) -> Any:
     if not isinstance(x, (str, bytes, bytearray, memoryview)):
         x = x.read()
     try:
-        return json.loads(x)
-    except json.JSONDecodeError:
-        return yaml.safe_load(x)
+        return orjson.loads(x)
+    except orjson.JSONDecodeError:
+        return yaml.load(x, Loader=yaml.CLoader)

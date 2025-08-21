@@ -11,7 +11,7 @@ class focused on what is run instead of how it is run.
 from typing import TYPE_CHECKING
 
 from pydatatask.host import Host
-from pydatatask.quota import Quota
+from pydatatask.quota import Quota, QuotaPoolSet
 
 if TYPE_CHECKING:
     from ..pipeline import Pipeline
@@ -64,6 +64,14 @@ class Executor:
         """Kill the pydatatask http agent that was spawned using this executor."""
         raise TypeError("Not supported, yikes")
 
-    def cache_flush(self) -> None:
+    def cache_flush(self, soft=False) -> None:
         """Flush any cached data."""
         pass
+
+    async def refresh_quota_pools(self):
+        pass
+
+    @property
+    def quota_pools(self) -> "QuotaPoolSet":
+        """Get the set of quota pools available to this executor."""
+        return QuotaPoolSet.get_localhost_quota_pool()

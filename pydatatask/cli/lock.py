@@ -66,19 +66,19 @@ class LocalAllocator(Allocator):
         path.mkdir(exist_ok=True, parents=True)
         basedir = tempfile.mkdtemp(dir=path)
         if spec.cls == "MetadataRepository":
-            result = Dispatcher("YamlFile", {"basedir": basedir})
+            result = Dispatcher("YamlFile", {"basedir": basedir, "annotations": spec.annotations or {}})
         elif spec.cls == "BlobRepository":
             if spec.compress_backend:
                 result = Dispatcher(
-                    "CompressedBlob", {"inner": {"cls": "File", "args": {"basedir": basedir, "extension": ".gz"}}}
+                    "CompressedBlob", {"inner": {"cls": "File", "args": {"basedir": basedir, "extension": ".gz"}}, "annotations": spec.annotations or {}}
                 )
             else:
-                result = Dispatcher("File", {"basedir": basedir})
+                result = Dispatcher("File", {"basedir": basedir, "annotations": spec.annotations or {}})
         elif spec.cls == "FilesystemRepository":
             if spec.compress_backend:
-                result = Dispatcher("Tarfile", {"inner": {"cls": "File", "args": {"basedir": basedir}}})
+                result = Dispatcher("Tarfile", {"inner": {"cls": "File", "args": {"basedir": basedir}}, "annotations": spec.annotations or {}})
             else:
-                result = Dispatcher("Directory", {"basedir": basedir})
+                result = Dispatcher("Directory", {"basedir": basedir, "annotations": spec.annotations or {}})
         else:
             return None
         result.args["compress_backup"] = spec.compress_backup

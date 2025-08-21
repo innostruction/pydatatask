@@ -5,6 +5,7 @@ Relationships between the tasks are implicit, defined by which repositories they
 
 from __future__ import annotations
 
+import time
 from typing import (
     Awaitable,
     Callable,
@@ -24,6 +25,7 @@ from pathlib import Path
 import asyncio
 import heapq
 import logging
+import math
 import random
 
 from typing_extensions import Self
@@ -35,12 +37,66 @@ from pydatatask.utils import supergetattr_path
 
 from . import repository as repomodule
 from . import task as taskmodule
-from .quota import Quota
+from .quota import Quota, QuotaPool, QuotaPoolSet, QuotaReservation
 from .session import Session
 
 l = logging.getLogger(__name__)
 
 already_logged_messages = set()
+
+yappi = None
+import os
+import sys
+
+def get_command_name():
+    args = [
+        x.replace('/', '-')
+        for x in sys.argv
+        if x and not ('-' in x) and not ('=' in x)
+    ]
+    return "-".join(args)
+
+def write_final_profiling_data():
+    if yappi is None:
+        return
+    """Write final comprehensive profiling data"""
+
+    os.makedirs("/pdt/profiling_data", exist_ok=True)
+
+    command_name = get_command_name()
+    pid = os.getpid()
+    
+    # Get and save function stats
+    func_stats = yappi.get_func_stats()
+    func_stats.save(f"/pdt/profiling_data/{command_name}_{pid}_final_profile_funcs.pstat", type="pstat")
+    
+    # Save in callgrind format for visualization tools
+    func_stats.save(f"/pdt/profiling_data/{command_name}_{pid}_final_profile_funcs.callgrind", type="callgrind")
+    
+    # Get and save thread stats
+    thread_stats = yappi.get_thread_stats()
+    with open(f"/pdt/profiling_data/{command_name}_{pid}_final_profile_threads.txt", "w") as f:
+        thread_stats.print_all(out=f)
+
+def write_profiling_snapshot(iteration):
+    if yappi is None:
+        return
+    """Write current profiling snapshot to a file without stopping profiler"""
+    
+    # Get current stats
+    stats = yappi.get_func_stats()
+
+    os.makedirs("/pdt/profiling_data", exist_ok=True)
+
+    command_name = get_command_name()
+    pid = os.getpid()
+    
+    # Write to file in pstat format (for later processing)
+    stats.save(f"/pdt/profiling_data/{command_name}_{pid}_profile_snapshot_{iteration}.pstat", type="pstat")
+    
+    # Optionally clear stats to avoid memory buildup
+    # Only do this if you don't need cumulative stats
+    # yappi.clear_stats()
 
 
 def debug_log(logger, *args, **kwargs):
@@ -55,24 +111,33 @@ def debug_log(logger, *args, **kwargs):
 
 __all__ = ("Pipeline",)
 
+async def dummy_prio(t, j, r):
+    return 1.0
 
 @dataclass
 class _JobPrioritizer:
-    priority: Callable[[str, str, int], float]
+    priority_func: Callable[[str, str, int], Awaitable[float]]
     task: taskmodule.Task
     job: str
     replica: int = 0
+    _priority: float | None = None
 
-    def peek(self) -> float:
+    @property
+    def priority(self):
+        assert self._priority is not None
+        return self._priority
+
+    async def peek(self):
         """Return this replica's priority."""
-        return self.priority(self.task.name, self.job, self.replica)
+        self._priority = await self.priority_func(self.task.name, self.job, self.replica)
 
-    def advance(self):
+    async def advance(self):
         """Move on to the next replica."""
         self.replica += 1
+        await self.peek()
 
     def __lt__(self, other: "_JobPrioritizer") -> bool:
-        return self.peek() > other.peek()
+        return self.priority > other.priority
 
 
 @dataclass
@@ -135,7 +200,7 @@ class Pipeline:
         self,
         tasks: Iterable[taskmodule.Task],
         session: Session,
-        priority: Optional[Callable[[str, str, int], float]] = None,
+        priority: Optional[Callable[[str, str, int], Awaitable[float]]] = None,
         agent_version: str = "unversioned",
         agent_secret: str = "insecure",
         agent_port: int = 6132,
@@ -158,7 +223,7 @@ class Pipeline:
         self.tasks: Dict[str, taskmodule.Task] = {task.name: task for task in tasks}
         self._opened = False
         self.session = session
-        self.priority = priority or (lambda x, y, z: 1.0)
+        self.priority = priority or dummy_prio
         self._graph: Optional["networkx.classes.digraph.DiGraph"] = None
         self.agent_version: str = agent_version
         self.agent_secret: str = agent_secret
@@ -171,15 +236,33 @@ class Pipeline:
         self.global_script_env = global_script_env or {}
         self.max_job_quota = max_job_quota
         self.backoff: Dict[Tuple[str, str], datetime] = {}
+        self.cancel_cache: set[tuple[str, str]] = set()
+        self.enable_task_dependencies = False
+
+        self._last_hard_cache_clear = None
+        self.__last_quota_pools_print = 0
 
         for task in tasks:
             if task is not self.tasks[task.name]:
                 raise NameError(f"The task name {task.name} is duplicated")
 
-    def cache_flush(self):
+    def cache_flush(self, soft=False):
         """Flush any in-memory caches."""
+        try:
+            if soft:
+                if self._last_hard_cache_clear is None:
+                    soft = False
+                elif time.time() - self._last_hard_cache_clear < 60*30:
+                    soft = False
+
+            if not soft:
+                self._last_hard_cache_clear = time.time()
+        except:
+            l.exception("Failed to flush cache")
+
         for task in self.tasks.values():
-            task.cache_flush()
+            task.cache_flush(soft=soft)
+        # TODO should we clear cancel_cache? it won't hurt but will it help?
 
     def settings(
         self,
@@ -190,6 +273,7 @@ class Pipeline:
         require_success: Optional[bool] = None,
         task_allowlist: Optional[List[str]] = None,
         task_denylist: Optional[List[str]] = None,
+        enable_task_dependencies: Optional[bool] = None,
     ):
         """This method can be called to set properties of the current run. Only settings set to non-none will be
         updated.
@@ -204,9 +288,13 @@ class Pipeline:
             but-failed. If fail_fast is set, this will abort the pipeline; if fail_fast is unset, this will eventually
             retry the task.
         :param task_allowlist: A list of the only tasks which should be scheduled
+        :param task_denylist: A list of tasks which should not be scheduled
+        :param enable_task_dependencies: If set to True, force all dependencies of a task to be enabled when that task is enabled.
         """
         if fail_fast is not None:
             self.fail_fast = fail_fast
+        if enable_task_dependencies is not None:
+            self.enable_task_dependencies = enable_task_dependencies
         for task in self.tasks.values():
             if synchronous is not None:
                 task.synchronous = synchronous
@@ -310,8 +398,12 @@ class Pipeline:
         if not self._opened:
             raise Exception("Pipeline must be opened")
 
+        start_time = time.time()
         info = await self._update_only_update()
+        end_time = time.time()
+        l.info("_update_only_update took %.2fs to return", end_time - start_time)
         result2 = (await self._update_only_launch(info)) if launch else False
+        l.info("_update_only_launch took %.2fs to return", time.time() - end_time)
         return any(any(live) or any(reaped) for live, reaped, _ in info.values()) or result2
 
     async def _update_only_update(self) -> Dict[str, Tuple[Dict[Tuple[str, int], datetime], Set[str], Set[str]]]:
@@ -325,8 +417,15 @@ class Pipeline:
 
         to_gather = (task.update() for task in self.tasks.values())
         gathered = dict(zip(self.tasks, await asyncio.gather(*to_gather, return_exceptions=False)))
-        self.cache_flush()
+        self.cache_flush(soft=True)
         return gathered
+
+    async def _enable_dependencies(self, task_name: str) -> None:
+        for pred in self.task_graph.predecessors(self.tasks[task_name]):
+            if self.tasks[pred.name].disabled:
+                self.tasks[pred.name].disabled = False
+                l.debug(f"{pred.name} is dependencies of {task_name} and has been re-enabled.")
+                await self._enable_dependencies(pred.name)
 
     async def _update_only_launch(
         self, info: Dict[str, Tuple[Dict[Tuple[str, int], datetime], Set[str], Set[str]]]
@@ -339,6 +438,11 @@ class Pipeline:
         if not self._opened:
             raise Exception("Pipeline must be opened")
 
+        if self.enable_task_dependencies:
+            for task_name, task in self.tasks.items():
+                if not task.disabled:
+                    await self._enable_dependencies(task_name)
+
         now = datetime.now(tz=timezone.utc)
         self.backoff.update(
             {
@@ -350,13 +454,63 @@ class Pipeline:
 
         task_list = list(self.tasks.values())
         # l.debug("Collecting launchable jobs")
-        to_gather = await asyncio.gather(*(self._gather_ready_jobs(task) for task in self.tasks.values()))
+        to_gather = await asyncio.gather(*(self._gather_ready_cancelled_jobs(task) for task in self.tasks.values()))
         entries = {}
         quota_overrides = {}
         delayed = False
 
+        tasks_to_mark_as_cancelled = set()
+
+        async def cancel_single_job(task: taskmodule.Task, job: str) -> None:
+            """Cancel a single job and handle the result."""
+            # don't send too many cancel requests for stuff we've already killed
+            if (task.name, job) in self.cancel_cache:
+                return
+            try:
+                # check if the job is already done (except for tasks which may have restarted)
+                try:
+                    must_check = (
+                        task.replicable
+                        or isinstance(task, taskmodule.ContainerSetTask)
+                    )
+                    if not must_check:
+                        if task.require_success:
+                            done_yaml = await task.done.info(job)
+                            if not done_yaml or not done_yaml.get('success', False):
+                                must_check = True
+                        elif not await task.done.contains(job):
+                            must_check = True
+                except:
+                    must_check = True
+                if must_check:
+                    await task.cancel_task(job, None)
+                if task.name == 'canonical_build':
+                    tasks_to_mark_as_cancelled.add(job)
+            except:  # pylint: disable=bare-except
+                if self.fail_fast:
+                    raise
+                l.exception("Failed to cancel %s:%s", task, job)
+            else:
+                self.cancel_cache.add((task.name, job))
+
+        # Collect all cancel operations to run in parallel
+        cancel_operations = []
+        for (_, job_list), task in zip(to_gather, task_list):
+            for job in job_list:
+                cancel_operations.append(cancel_single_job(task, job))
+        
+        # Run all cancel operations in parallel
+        if cancel_operations:
+            await asyncio.gather(*cancel_operations, return_exceptions=True)
+
+        if tasks_to_mark_as_cancelled:
+            for job in tasks_to_mark_as_cancelled:
+                info_file = Path(f'/pdt/cancel_complete_{job}.info')
+                info_file.touch()
+
+        active_managers = set()
         by_manager: DefaultDict[Quota, _SchedState] = defaultdict(_SchedState)
-        for job_list, task in zip(to_gather, task_list):
+        for (job_list, _), task in zip(to_gather, task_list):
             for job in job_list:
                 if (task.name, job) in self.backoff:
                     if now < self.backoff[(task.name, job)]:
@@ -366,55 +520,96 @@ class Pipeline:
                     if fq is not None:
                         quota_overrides[(task.name, job)] = fq
                 prio = _JobPrioritizer(self.priority, task, job)
+                await prio.peek()
                 sched = by_manager[task.resource_limit]
-                sched.initial_jobs.append((prio.peek(), task.name, job))
-                entries[_LaunchRecordA(task.name, job, 0)] = _LaunchRecordB(prio.peek(), False, False, False)
-                prio.advance()
+                if task.manager is not None:
+                    active_managers.add(task.manager)
+                sched.initial_jobs.append((prio.priority, task.name, job))
+                entries[_LaunchRecordA(task.name, job, 0)] = _LaunchRecordB(prio.priority, False, False, False)
+                await prio.advance()
                 if task.replicable:
                     heapq.heappush(sched.replica_heap, prio)
 
+        # Refresh the resource limits for all task managers
+        await asyncio.gather(*(manager.refresh_quota_pools() for manager in active_managers))
+
         entries.update(
             {
-                _LaunchRecordA(task, job, 0): _LaunchRecordB(self.priority(task, job, 0), True, False, True)
+                _LaunchRecordA(task, job, 0): _LaunchRecordB(await self.priority(task, job, 0), True, False, True)
                 for task, tinfo in info.items()
                 for job in tinfo[1]
             }
         )
         entries.update(
             {
-                _LaunchRecordA(task, job, replica): _LaunchRecordB(self.priority(task, job, replica), True, True, False)
+                _LaunchRecordA(task, job, replica): _LaunchRecordB(await self.priority(task, job, replica), True, True, False)
                 for task, tinfo in info.items()
                 for job, replica in tinfo[0]
             }
         )
 
         if all(not sched.initial_jobs for sched in by_manager.values()):
-            self.cache_flush()
+            self.cache_flush(soft=True)
             return delayed
 
-        queue: asyncio.Queue[Optional[Tuple[str, str, int, bool]]] = asyncio.Queue()
+        queue: asyncio.Queue[Optional[Tuple[str, str, int, bool, Optional[QuotaReservation]]]] = asyncio.Queue()
         N_WORKERS = 15
         N_LEADERS = len(by_manager)
 
+        def print_stats():
+            if yappi is None:
+                return
+
+            import time
+            #yappi.get_func_stats().print_all()
+            #yappi.get_thread_stats().print_all()
+            write_profiling_snapshot(time.time())
+
+        print_stats()
+
         async def leader(quota: Quota, sched: _SchedState) -> None:
-            used = sum(
-                (
-                    self.tasks[task].job_quota
-                    for task, (live, _, _) in info.items()
-                    for (_, replica) in live
-                    if replica == 0
-                ),
-                Quota.parse(0, 0),
-            )
             live_jobs = {taskname: {job for job, _ in live} for taskname, (live, _, _) in info.items()}
+            
+            used = Quota.parse(0, 0)
+            #for task, (live, _, _) in info.items():
+            #    for (job, replica) in live:
+            #        if replica == 0:
+            #            task_quota = await self.tasks[task].get_quota_for_job(job)
+            #            used += task_quota
+
+            # We will figure out current usage of each quota
+            # This will be a list of pools which will have updated usage
+            # info from the live tasks
+            quota_with_used: QuotaPoolSet = await QuotaPool.calculate_usage(
+                self,
+                live_jobs,
+            )
+
+            if self.__last_quota_pools_print % 20 == 0:
+                l.debug("Avalible Quota Pools:")
+                quota_with_used.log()
+            self.__last_quota_pools_print += 1
+
             now = datetime.now(tz=timezone.utc)
             last_period = {
-                taskname: sum(1 for _, time in live.items() if time + self.tasks[taskname].max_spawn_jobs_period > now)
+                taskname: sum(
+                    1 for (_, replica), time in live.items()
+                        if time + self.tasks[taskname].max_spawn_jobs_period > now
+                )
                 for taskname, (live, _, _) in info.items()
             }
             base_already = {
                 (task, job, replica) for task, (live, _, _) in info.items() for (job, replica) in live if replica == 0
             }
+            def get_age_of_job(task, job):
+                for (job_, replica), time in info[task][0].items():
+                    if job_ != job:
+                        continue
+                    if replica != 0:
+                        continue
+                    return now - time
+                return None
+
             to_kill = {
                 (task, job, replica) for task, (live, _, _) in info.items() for (job, replica) in live if replica != 0
             }
@@ -425,22 +620,51 @@ class Pipeline:
                 if (task, job, 0) in base_already:
                     continue
                 if job not in live_jobs[task]:
-                    mcj = self.tasks[task].max_concurrent_jobs
+                    # Each task can have a max number of jobs overall
+                    mcj = await self.tasks[task].get_max_concurrent_jobs(job)
                     if mcj is not None and len(live_jobs[task]) >= mcj:
                         l.debug("Too many concurrent jobs (%d) to launch %s:%s ", mcj, task, job)
                         continue
-                alloc = quota_overrides.get((task, job), None) or self.tasks[task].job_quota
-                excess = (used + alloc).excess(quota)
-                if excess is not None:
-                    l.debug(
-                        "Not enough quota %s to allocate task %s:%s which required %s already used %s",
-                        quota,
-                        task,
-                        job,
-                        alloc,
-                        used,
+
+                avaliable_quota_pools: QuotaPoolSet = await quota_with_used.get_matching_pools(
+                    self,
+                    task,
+                    job,
+                )
+                if avaliable_quota_pools is None or len(avaliable_quota_pools) == 0:
+                    # This task has lablel selectors which parclude it from any node pools, it will never be able to launch
+                    l.warn("😕 No quota pools for task %s, it will never launch", task)
+                    continue
+
+                # See if we can launch it in any of the quota pools
+                (
+                    launch_reservation,
+                    alloc,
+                    excess,
+                ) = await avaliable_quota_pools.try_reserve(
+                    task=self.tasks[task],
+                    job=job,
+                    replica=0,
+                    quota=quota_overrides.get(
+                        (task, job),
+                        None,
                     )
-                    break
+                )
+
+                if excess is not None or launch_reservation is None:
+                    #l.debug(
+                    #    "TASK: %s, JOB: %s: Not enough quota: \n\tTried allocating %s\n\tAlready used %s\n\tExcess in the %s resource\n\tMaximum quota available %s.",
+                    #    task, job,
+                    #    alloc,
+                    #    used,
+                    #    excess,
+                    #    quota,
+                    #)
+                    if launch_reservation is not None:
+                        # NOTE: this call originally had something to do with QuotaPoolSet. Real or hallucinated?
+                        launch_reservation.release()
+                    continue
+
                 if last_period[task] >= self.tasks[task].max_spawn_jobs:
                     l.debug(
                         "Rate limit launching %s:%s: %d/%d",
@@ -449,51 +673,173 @@ class Pipeline:
                         last_period[task],
                         self.tasks[task].max_spawn_jobs,
                     )
+                    if launch_reservation is not None:
+                        launch_reservation.release()
                     continue
+
+                l.debug(
+                    "LAUNCHING TASK: %s, JOB: %s: With quota: %s in pool %s",
+                    task, job, alloc,
+                    launch_reservation.pool if launch_reservation is not None else "None",
+                )
                 last_period[task] += 1
-                used += alloc
                 live_jobs[task].add(job)
-                await queue.put((task, job, 0, False))
+                await queue.put((task, job, 0, False, launch_reservation))
                 entries[_LaunchRecordA(task, job, 0)] = _LaunchRecordB(prio, False, True, False)
             else:
+                task_replica_counts = dict()
                 # schedule replicas
                 while sched.replica_heap:
                     next_guy = sched.replica_heap[0]
                     if next_guy.task.max_replicas is not None and next_guy.replica >= next_guy.task.max_replicas:
                         heapq.heappop(sched.replica_heap)
+                        l.debug(f"🤚 Limiting replicas for task {next_guy.task.name} due to task-wide max_replicas limit {next_guy.replica}/{next_guy.task.max_replicas}...")
                         continue
-                    alloc = (
-                        quota_overrides.get((next_guy.task.name, next_guy.job), None)
-                        or self.tasks[next_guy.task.name].job_quota
+
+                    #l.debug(f"====== REPLICA {next_guy.task}:{next_guy.job}#{next_guy.replica} ======")
+
+                    avaliable_quota_pools: QuotaPoolSet = await quota_with_used.get_matching_pools(
+                        self,
+                        next_guy.task.name,
+                        next_guy.job,
                     )
-                    excess = (used + alloc).excess(quota)
-                    mcj = self.tasks[next_guy.task.name].max_concurrent_jobs
+
+                    task_replica_counts[next_guy.task.name] = task_replica_counts.get(next_guy.task.name, 0) + 1
+
+                    #l.debug(f"~~~~~ AVAILABLE POOLS ~~~~~")
+                    #avaliable_quota_pools.log()
+                    #l.debug(f"~~~~~~~~~~~~~~~~~~~~~~~~~~~\n")
+
+                    if avaliable_quota_pools is None or len(avaliable_quota_pools) == 0:
+                        l.warn("😕 No quota pools for task %s, it will never replicate", next_guy.task)
+                        #l.info(f"============================\n")
+                        heapq.heappop(sched.replica_heap)
+                        continue
+                    
+                    mcj = await self.tasks[next_guy.task.name].get_max_concurrent_jobs(next_guy.job)
+
+                    if mcj is None and avaliable_quota_pools.has_autoscaling():
+                        raise Exception("🚨🚨🚨 YOU MUST SET max_concurrent_jobs FOR ANY REPLICABLE TASK OR IT WILL TAKE OVER THE WORLD 🚨🚨🚨")
+
+                    num_jobs = len(live_jobs.get(next_guy.task.name, []))
+                    num_jobs += task_replica_counts.get(next_guy.task.name, 0)
+
+                    instant_start_replicas = self.tasks[next_guy.task.name].starting_replicas or 1
+                    repl_per_min = self.tasks[next_guy.task.name].replicas_per_minute or 5
+
+                    job_age = get_age_of_job(next_guy.task.name, next_guy.job)
+                    #l.info(f"🕒 Job age: {job_age}")
+                    if job_age is None:
+                        job_age = timedelta(seconds=0)
+
+                    slow_start_max = instant_start_replicas + math.ceil(job_age.seconds / (60 / repl_per_min))
+                    #l.debug(f"🐢 Slow start max for {next_guy.task.name}:{next_guy.job}: {slow_start_max} (based on {repl_per_min} replicas per minute)")
+                    if next_guy.replica > slow_start_max:
+                        # We are going to slowly roll out the replicas
+                        # After a task has been launched for the first time
+                        heapq.heappop(sched.replica_heap)
+
+                        # No more replicas will be launched for this job
+                        # The rest of the replicas >= # will be killed
+                        l.debug(f"🐢 Limiting replicas for {next_guy.task.name}:{next_guy.job} due to slow start policy of {slow_start_max} replicas for task of age {job_age} ({repl_per_min} new replicas per minute)")
+                        #l.info(f"============================\n")
+                        continue
+
+                    #l.debug(f"~~~~~ TRYING TO RESERVE ~~~~~")
+                    (
+                        reservation,
+                        alloc,
+                        excess,
+                    ) = await avaliable_quota_pools.try_reserve(
+                        task=next_guy.task,
+                        job=next_guy.job,
+                        replica=next_guy.replica,
+                        quota=quota_overrides.get(
+                            (next_guy.task.name, next_guy.job),
+                            None,
+                        )
+                    )
+                    #l.info(f"reservation: {reservation}")
+                    #l.info(f"alloc: {alloc}")
+                    #l.info(f"excess: {excess}")
+                    #l.info(f"~~~~~~~~~~~~~~~~~~~~~~~~~~~\n")
+                    
+                    #l.info(f"~~~~~ POOLS AFTER RESERVE ~~~~~")
+                    #avaliable_quota_pools.log()
+                    #l.info(f"~~~~~~~~~~~~~~~~~~~~~~~~~~~\n")
+
+
                     if (
                         excess is not None
-                        or last_period[next_guy.task.name] >= self.tasks[next_guy.task.name].max_spawn_jobs
                         or (
-                            next_guy.job not in live_jobs[next_guy.task.name]
-                            and mcj is not None
-                            and len(live_jobs[next_guy.task.name]) > mcj
+                            # XXX this line used to be here, but it doesn't make sense. We want to stop replicating even if instances of this task were already running
+                            #next_guy.job not in live_jobs[next_guy.task.name] and
+                            mcj is not None
+                            and num_jobs > mcj
                         )
                     ):
+                        # We spawned too many so stop here (and not count it in quota if we got a reservation)...
                         heapq.heappop(sched.replica_heap)
-                    else:
-                        last_period[next_guy.task.name] += 1
-                        used += alloc
-                        tup = (next_guy.task.name, next_guy.job, next_guy.replica)
-                        if tup not in to_kill:
-                            await queue.put((*tup, False))
-                            entries[_LaunchRecordA(*tup)] = _LaunchRecordB(next_guy.peek(), False, True, False)
+                        
+                        if reservation is not None:
+                            reservation.release()
+
+                        if excess is not None:
+                            l.debug(f"😴 Limiting replicas for task {next_guy.task.name}:{next_guy.job} due to quota limit")
                         else:
-                            to_kill.remove(tup)
-                        next_guy.advance()
-                        heapq.heapreplace(sched.replica_heap, next_guy)
+                            l.debug(f"🤚 Limiting replicas for task {next_guy.task.name} due to task-wide max_concurrent_jobs limit {num_jobs-1}/{mcj}...")
+
+                        # No more replicas will be launched for this job
+                        # The replicas >= # will be killed
+                        #l.debug(f"============================\n")
+                        continue
+
+                    # Now we are either an existing replica or a new one
+                    tup = (next_guy.task.name, next_guy.job, next_guy.replica)
+                    if tup not in to_kill:
+                        # This is a new replica (not alive atm)
+
+                        #l.debug(f"🐣 This replica is not live yet!")
+
+                        if last_period[next_guy.task.name] >= self.tasks[next_guy.task.name].max_spawn_jobs:
+                            # We are rate limited so stop here
+                            l.debug(
+                                f"🐢 Limiting replicas for task {next_guy.task.name}:{next_guy.job} due to task-wide max_spawn_jobs limit %d/%d",
+                                last_period[next_guy.task.name],
+                                self.tasks[next_guy.task.name].max_spawn_jobs,
+                            )
+                            heapq.heappop(sched.replica_heap)
+                            if reservation is not None:
+                                reservation.release()
+
+                            #l.debug(f"============================\n")
+
+                            # No more replicas will be launched for this job
+                            continue
+
+                        else:
+                            # Ok to launch this replica, counting it in # of recent launches
+                            last_period[next_guy.task.name] += 1
+                            #l.debug(f"🚀 Launching replica {next_guy.task}:{next_guy.job}#{next_guy.replica}")
+                            #l.debug(f"🎟️ Reservation: {reservation}")
+                            await queue.put((*tup, False, reservation))
+                            entries[_LaunchRecordA(*tup)] = _LaunchRecordB(next_guy.priority, False, True, False)
+                    else:
+                        #l.debug(f"🧬 Keeping alive existing replica {next_guy.task}:{next_guy.job}#{next_guy.replica}")
+                        # Keep alive the existing replica
+                        to_kill.remove(tup)
+
+                    await next_guy.advance()
+                    heapq.heapreplace(sched.replica_heap, next_guy)
+                    #l.info(f"============================\n")
+                    continue
+
             # kill!!
             for task, job, replica in to_kill:
-                await queue.put((task, job, replica, True))
+                #l.debug(f"💀 Killing {task}:{job}#{replica}")
+                await queue.put((task, job, replica, True, None))
                 entries[_LaunchRecordA(task, job, replica)] = _LaunchRecordB(
-                    self.priority(task, job, replica), True, False, False
+                    await self.priority(task, job, replica), True, False, False
                 )
             # terminate
             for _ in range(N_WORKERS):
@@ -508,7 +854,7 @@ class Pipeline:
                     if quits == N_LEADERS:
                         break
                 else:
-                    task, job, replica, kill = jobt
+                    task, job, replica, kill, launch_reservation = jobt
                     if kill:
                         try:
                             l.info("Killing %s:%s.%d", task, job, replica)
@@ -520,7 +866,11 @@ class Pipeline:
                     else:
                         try:
                             l.info("Launching %s:%s", task, job)
-                            await self.tasks[task].launch(job, replica)
+                            await self.tasks[task].launch(
+                                job,
+                                replica,
+                                reservation=launch_reservation,
+                            )
                         except:  # pylint: disable=bare-except
                             if self.fail_fast:
                                 raise
@@ -539,7 +889,7 @@ class Pipeline:
         for entry in entries_list:
             l.debug("%s", entry)
 
-        self.cache_flush()
+        self.cache_flush(soft=True)
         return True
 
     async def kill_all(self):
@@ -547,13 +897,14 @@ class Pipeline:
         for task in self.tasks.values():
             await task.killall()
 
-    async def _gather_ready_jobs(self, task: taskmodule.Task) -> Set[str]:
+    async def _gather_ready_cancelled_jobs(self, task: taskmodule.Task) -> tuple[set[str], set[str]]:
         """Collect all jobs that are ready to be launched for a given task."""
         if task.disabled:
             # l.debug("%s is disabled - no jobs will be scheduled", task.name)
             debug_log(l, "%s is disabled - no jobs will be scheduled", task.name)
-            return set()
-        return set(await task.ready.keys())
+            return set(), set()
+        ready, cancel = await asyncio.gather(task.ready.keys(), task.cancel.keys())
+        return set(ready), set(cancel)
 
     @staticmethod
     def _make_single_func(
@@ -607,7 +958,10 @@ class Pipeline:
             raise TypeError("Cannot do key lookup on repository which is not MetadataRepository")
 
         async def mapper(_job, info):
-            return str(supergetattr_path(info, splitkey[1:]))
+            try:
+                return str(supergetattr_path(info, splitkey[1:]))
+            except:
+                return ""
 
         mapped = related.map(mapper, [])
 

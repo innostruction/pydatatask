@@ -48,19 +48,34 @@ class QueryRepository(Repository):
         super().__init__()
         self.query = Query(QueryValueType.Repository, query, {}, getters or {}, repos or {}, jq or {})
         self._cached: Optional[Repository] = None
+        self._repo_in_query_str = None
+        if self.query.query:
+            self._repo_in_query_str = next((
+                repo
+                for reponame, repo in self.query.repos.items()
+                if re.search("\\b" + reponame + "\\b", self.query.query)),
+                None
+            )
+
 
     def footprint(self):
         # HACK LMAO
-        for reponame, repo in self.query.repos.items():
-            if re.search("\\b" + reponame + "\\b", self.query.query):
-                yield from repo.footprint()
+        if self._repo_in_query_str:
+            yield from self._repo_in_query_str.footprint()
+        else:
+            for reponame, repo in self.query.repos.items():
+                if re.search("\\b" + reponame + "\\b", self.query.query):
+                    yield from repo.footprint()
 
-    def cache_flush(self):
+    def cache_flush(self, soft=False):
         self._cached = None
         # HACK LMAO
-        for reponame, repo in self.query.repos.items():
-            if re.search("\\b" + reponame + "\\b", self.query.query):
-                repo.cache_flush()
+        if self._repo_in_query_str:
+            self._repo_in_query_str.cache_flush(soft=soft)
+        else:
+            for reponame, repo in self.query.repos.items():
+                if re.search("\\b" + reponame + "\\b", self.query.query):
+                    repo.cache_flush(soft=soft)
 
     async def _resolve(self) -> Repository:
         if self._cached is None:

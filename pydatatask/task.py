@@ -37,6 +37,7 @@ from enum import Enum, auto
 from pathlib import Path
 import asyncio
 import copy
+import time
 import inspect
 import json
 import logging
@@ -54,12 +55,12 @@ import jinja2.compiler
 import sonyflake
 import yaml
 
-from pydatatask.host import LOCAL_HOST, Host, HostOS
+from pydatatask.host import LOCAL_HOST, Host, HostOS, HostNode
 import pydatatask
 
 from . import executor as execmodule
 from . import repository as repomodule
-from .quota import Quota, _MaxQuotaType
+from .quota import Quota, _MaxQuotaType, _TemplateQuotaType, QuotaPool, QuotaPoolSet, QuotaReservation, LOCALHOST_QUOTA
 from .utils import (
     STDOUT,
     AReadStreamBase,
@@ -89,6 +90,10 @@ __all__ = (
 # pylint: disable=broad-except,bare-except
 
 
+class _TemplateIntType(str):
+    pass
+
+
 @dataclass
 class TemplateInfo:
     """The data necessary to assemble a template including a link argument."""
@@ -116,11 +121,32 @@ async def render_template(template, template_env: Dict[str, Any]):
     )
 
     def shquote(s):
+        if type(s) == list:
+            return " ".join([shlex.quote(str(x)) for x in s])
         return shlex.quote(str(s))
+
+    def export_env(env):
+        out = ""
+        if type(env) == list:
+            for entry in env:
+                out += f"export {entry.get('key')}={shlex.quote(str(entry.get('value')))}\n"
+        elif type(env) == dict:
+            for key, value in env.items():
+                out += f"export {key}={shlex.quote(str(value))}\n"
+        return out
+
+    def base64_files(files):
+        out = ""
+        for path, val in files.items():
+            base64content = val["content"]
+            out += f"echo '{base64content}' | base64 -d > {path}\n"
+        return out
 
     j.filters["shquote"] = shquote
     j.filters["to_yaml"] = yaml.safe_dump
     j.filters["to_json"] = json.dumps
+    j.filters["export_env"] = export_env
+    j.filters["base64_files"] = base64_files
     j.code_generator_class = ParanoidAsyncGenerator
     templating = j.from_string(template)
     try:
@@ -152,6 +178,7 @@ class LinkKind(Enum):
     StreamingOutputFilepath = auto()
     StreamingInputFilepath = auto()
     RequestedInput = auto()
+    Cancel = auto()
 
 
 INPUT_KINDS: Set[LinkKind] = {
@@ -161,6 +188,7 @@ INPUT_KINDS: Set[LinkKind] = {
     LinkKind.InputRepo,
     LinkKind.StreamingInputFilepath,
     LinkKind.RequestedInput,
+    LinkKind.Cancel,
 }
 OUTPUT_KINDS: Set[LinkKind] = {
     LinkKind.OutputId,
@@ -195,6 +223,35 @@ class Link:
     DANGEROUS_filename_is_key: bool
     content_keyed_md5: bool
     equals: Optional[str] = None
+    skip_if_path_exists: Optional[str] = None
+    template_cache_key: Optional[str] = None
+    use_cache_symlink: Optional[bool] = False
+
+def calculate_generic_job_quota(
+    task: Union[ProcessTask, ExecutorTask, ContainerTask],
+    quota: Union[Quota, _MaxQuotaType],
+    update_quota=True,
+    pool: Optional[QuotaPool] = None
+):
+    if pool:
+        limit = pool.get_quota_per_node()
+    else:
+        limit = task.resource_limit
+
+    if isinstance(quota, _MaxQuotaType):
+        r = (task._max_quota or limit) * quota
+    else:
+        r = copy.copy(quota)
+    if r.excess(limit):
+        r = limit * 0.9
+        l.warning(
+            "%s can never fit within the resource limits. Automatically adjusting its quota to %s",
+            task.name,
+            r,
+        )
+        if update_quota:
+            task._job_quota = r
+    return r
 
 
 class Task(ABC):
@@ -203,8 +260,9 @@ class Task(ABC):
     def __init__(
         self,
         name: str,
-        done: "repomodule.MetadataRepository",
-        ready: Optional["repomodule.Repository"] = None,
+        done: repomodule.MetadataRepository,
+        *,
+        ready: repomodule.Repository | None = None,
         disabled: bool = False,
         failure_ok: bool = False,
         long_running: bool = False,
@@ -213,14 +271,17 @@ class Task(ABC):
         replicable: bool = False,
         max_replicas: Optional[int] = None,
         cache_dir: Optional[str] = None,
+        extras: Optional[Dict[str, str]] = None,
     ):
         self.name = name
         self._ready = ready
+        self._cancel: repomodule.Repository | None = None
         self.links: Dict[str, Link] = {}
         self.synchronous = False
         self.metadata = True
         self.debug_trace = False
         self.require_success = False
+        self.extras = extras
         self.disabled = disabled
         self.agent_url = ""
         self.agent_secret = ""
@@ -240,10 +301,23 @@ class Task(ABC):
             "done.filter[.getsuccess]()", {"success": pydatatask.query.parser.QueryValueType.Bool}, {"done": done}
         )
         self._max_quota: Optional[Quota] = None
-        self.max_concurrent_jobs: Optional[int] = None
+        self.max_concurrent_jobs: Optional[Union[int, _TemplateIntType]] = None
         self.max_spawn_jobs = 100
         self.max_spawn_jobs_period = timedelta(minutes=1)
         self.cache_dir = cache_dir
+        self.starting_replicas: Optional[int] = None
+        self.replicas_per_minute: Optional[int] = None
+        self.pod_labels: dict[str, Any] | None = None
+        self.node_labels: dict[str, Any] | None = None
+        self.node_labels_function: str | None = None
+        self.node_taints: dict[str, Any] | None = None
+        self.node_affinity: dict[str, Any] | None = None
+        self.replica_node_labels: dict[str,Any] | None = None
+        self.replica_node_taints: dict[str, Any] | None = None
+        self.replica_node_affinity: dict[str, Any] | None = None
+
+        self.__build_template_env_cache = {}
+        self.__render_template_cache = {}
 
         self.link(
             "done",
@@ -265,14 +339,19 @@ class Task(ABC):
     def __repr__(self):
         return f"<{type(self).__name__} {self.name}>"
 
-    def cache_flush(self):
+    def cache_flush(self, soft=False):
         """Flush any in-memory caches."""
         self._related_cache.clear()
         self._filtered_cache.clear()
         for link in self.links.values():
-            link.repo.cache_flush()
+            link.repo.cache_flush(soft=soft)
         if self._ready is not None:
-            self._ready.cache_flush()
+            self._ready.cache_flush(soft=soft)
+
+    @property
+    @abstractmethod
+    def manager(self) -> execmodule.Executor:
+        raise NotImplementedError
 
     @property
     @abstractmethod
@@ -349,8 +428,17 @@ class Task(ABC):
 
         For shell script-based tasks, this will be a shell script, but for other tasks it may be other objects.
         """
-        is_filesystem = isinstance(self.links[link_name].repo, repomodule.FilesystemRepository)
+        link_info = self.links[link_name]
+        is_filesystem = isinstance(link_info.repo, repomodule.FilesystemRepository)
+        skip_if_path_exists = link_info.skip_if_path_exists
+
         payload_filename = self.mktemp(job + "-zip") if is_filesystem else filename
+        # Force require template_cache_key to be set
+        cache_key = None
+        if link_info.template_cache_key:
+            cache_key = link_info.template_cache_key
+        #if cache_key is None:
+        #    cache_key = f'cache-{self.name}-{link_name}-{job}'
         url = f"{self.agent_url}/data/{self.name}/{link_name}/{job}"
         headers = {"Cookie": "secret=" + self.agent_secret}
         result = self.host.mk_http_get(
@@ -361,13 +449,25 @@ class Task(ABC):
             handle_err=self.mk_error_handler(url, headers),
         )
         if self.cache_dir is not None and cache_key is not None:
-            result = self.host.mk_cache_get_static(payload_filename, cache_key, result, self.cache_dir)
+            result = self.host.mk_cache_get_static(payload_filename, cache_key, result, self.cache_dir, use_cache_symlink=link_info.use_cache_symlink)
         if is_filesystem:
-            result += self.host.mk_unzip(filename, payload_filename)
+            zip_res = self.host.mk_unzip(filename, payload_filename)
+            #if self.cache_dir is not None and cache_key is not None:
+            #    zip_res = self.host.mk_cache_get_static(filename, 'unzip-' + cache_key, zip_res, self.cache_dir, use_cache_symlink=False) # disabling symlinks for now due to issues with rsync having files vanish...
+            result += zip_res
+
+        if skip_if_path_exists is not None:
+            result = f"""
+            if [ -e "{skip_if_path_exists}" ]; then
+              echo "Skipping download/extract of {url} because {skip_if_path_exists} exists" 
+            else
+              {result}
+            fi
+            """
         return result
 
     def mk_repo_put(
-        self, filename: str, link_name: str, job: str, hostjob: Optional[str] = None, bypass_dangerous: bool = False
+        self, filename: str, link_name: str, job: str, hostjob: Optional[str] = None, bypass_dangerous: bool = False, is_streaming: bool = False
     ) -> Any:
         """Generate logic to perform an repository insert for the task host system.
 
@@ -379,6 +479,11 @@ class Task(ABC):
             f"?hostjob={hostjob}" if hostjob is not None else ""
         )
         headers = {"Cookie": "secret=" + self.agent_secret}
+        nginx_file = f'{self.name}.{link_name}.{job}'
+        nginx_url = self.agent_url.replace('pydatatask', 'nginx-pydatatask') + f'/data/{nginx_file}'
+
+        is_filesystem_repo = isinstance(self.links[link_name].repo, repomodule.FilesystemRepository)
+        should_use_nginx = is_filesystem_repo and os.environ.get("KUBERNETES_PORT") is not None
 
         content_keyed_md5 = self.links[link_name].content_keyed_md5
         DANGEROUS_filename_is_key = self.links[link_name].DANGEROUS_filename_is_key
@@ -398,9 +503,19 @@ class Task(ABC):
             verbose=self.debug_trace,
             handle_err=self.mk_error_handler(url, headers),
             required_for_success=self.links[link_name].required_for_success,
+            nginx_url=nginx_url if should_use_nginx else None,
+            nginx_file=nginx_file if should_use_nginx else None
         )
         if is_filesystem:
             result = self.host.mk_zip(payload_filename, filename) + result
+        
+        if self.require_success and not is_streaming:
+            # When require_success is true, we want to avoid uploading if the task has failed
+            result = f'''
+            if [ "$RETCODE" -eq 0 ]; then
+                {result}
+            fi
+            '''
         return result
 
     def mk_query_function(self, query_name: str) -> Tuple[Any, Any]:
@@ -422,14 +537,16 @@ class Task(ABC):
                 esac
                 shift 2
             done
-            {self.host.mk_http_post(
-                "$INPUT_FILE",
-                url,
-                headers,
-                "/dev/stdout",
-                verbose=self.debug_trace,
-                required_for_success=False,
-            )}
+            {
+                self.host.mk_http_post(
+                    "$INPUT_FILE",
+                    url,
+                    headers,
+                    "/dev/stdout",
+                    verbose=self.debug_trace,
+                    required_for_success=False,
+                )
+            }
             rm $INPUT_FILE
         }}
         """,
@@ -550,7 +667,7 @@ class Task(ABC):
         {self.host.mk_mkdir(filepath) if mkdir else ""}
         {self.host.mk_mkdir(scratch)}
         {self.host.mk_mkdir(lock)}
-        {'; '.join(self.host.mk_mkdir(cokey_dir) for cokey_dir in cokeyed.values())}
+        {"; ".join(self.host.mk_mkdir(cokey_dir) for cokey_dir in cokeyed.values())}
         {idgen_function}
         watcher_{nonce}() {{
           set +x
@@ -565,17 +682,21 @@ class Task(ABC):
                 WATCHER_LAST=1
             fi
             for f in *; do
-              if [ -e "$f" ] && ! [ -e "{scratch}/$f" ] && ! [ -e "{lock}/$f" ] && [ "$(($(date +%s) - $(stat -c %Y "$f")))" -ge 5 ]; then
+              if [ -e "$f" ] && ! [ -e "{scratch}/$f" ] && ! [ -e "{
+            lock
+        }/$f" ] && [ "$(($(date +%s) - $(stat -c %Y "$f")))" -ge 5 ]; then
                 ID=$(idgen_{nonce} "$f")
                 ln -sf "$PWD/$f" {upload}
-                {self.mk_repo_put(upload, link_name, "$ID", hostjob, bypass_dangerous=True)}
+                {self.mk_repo_put(upload, link_name, "$ID", hostjob, bypass_dangerous=True, is_streaming=True)}
                 rm {upload}
-                {'; '.join(
-                  f'{prep_upload(cokey, cokeydir)}'
-                  f'({self.mk_repo_put_cokey(upload, link_name, cokey, "$ID", hostjob)}); '
-                  f'rm {upload}'
-                  for cokey, cokeydir
-                  in cokeyed.items())}
+                {
+            "; ".join(
+                f"{prep_upload(cokey, cokeydir)}"
+                f"({self.mk_repo_put_cokey(upload, link_name, cokey, '$ID', hostjob)}); "
+                f"rm {upload}"
+                for cokey, cokeydir in cokeyed.items()
+            )
+        }
                 echo $ID >"{scratch}/$f"
               fi
             done
@@ -603,6 +724,7 @@ class Task(ABC):
             raise ValueError("Not sure how to do this off of linux")
         scratch = self.host.mktemp("scratch")
         download = self.host.mktemp("download")
+        download_list_temp = self.host.mktemp("key-list")
         lock = self.host.mktemp("lock")
         stream_url = f"{self.agent_url}/stream/{self.name}/{link_name}/{job}"
         stream_headers = {"Cookie": f"secret={self.agent_secret}"}
@@ -614,11 +736,12 @@ class Task(ABC):
         {self.host.mk_mkdir(lock)}
         watcher_{nonce}() {{
             set +x
+            set +e
             cd {filepath}
             while true; do
                 sleep 5
-                {self.mk_http_get(download, stream_url, stream_headers, handle_err=self.mk_error_handler(stream_url, stream_headers))}
-                for ID in $(cat {download}); do
+                {self.mk_http_get(download_list_temp, stream_url, stream_headers, handle_err=self.mk_error_handler(stream_url, stream_headers))}
+                for ID in $(cat {download_list_temp}); do
                     if ! [ -e "{scratch}/$ID" ]; then
                         touch {lock}/$ID
                         {self.mk_repo_get(download, link_name, "$ID")}
@@ -663,6 +786,14 @@ class Task(ABC):
             repomodule.AggregateOrRepository(**self.inhibits_start),
         )
 
+    def _make_cancel(self):
+        acc = {}
+        for link_name, link in self.links.items():
+            if link.kind != LinkKind.Cancel:
+                continue
+            acc[link_name] = self._repo_related(link_name)
+        return repomodule.AggregateOrRepository(**acc)
+
     def derived_hash(self, job: str, link_name: str, along: bool = True) -> str:
         """For allocate-key links, determine the allocated job id.
 
@@ -701,6 +832,9 @@ class Task(ABC):
         DANGEROUS_filename_is_key: bool = False,
         content_keyed_md5: bool = False,
         equals: Optional[str] = None,
+        skip_if_path_exists: Optional[str] = None,
+        template_cache_key: Optional[str] = None,
+        use_cache_symlink: Optional[bool] = False,
     ):
         """Create a link between this task and a repository.
 
@@ -727,7 +861,7 @@ class Task(ABC):
             plugged into.
         """
         if is_input is None:
-            is_input = kind in INPUT_KINDS
+            is_input = kind in INPUT_KINDS and kind != LinkKind.Cancel
             if required_for_start is None and kind in (LinkKind.StreamingInputFilepath, LinkKind.RequestedInput):
                 required_for_start = False
         if is_output is None:
@@ -737,7 +871,7 @@ class Task(ABC):
         if required_for_start is None:
             required_for_start = is_input
         if inhibits_start is None:
-            inhibits_start = False
+            inhibits_start = kind == LinkKind.Cancel
         if required_for_success is None:
             required_for_success = False
         if inhibits_output is None:
@@ -764,6 +898,9 @@ class Task(ABC):
             DANGEROUS_filename_is_key=DANGEROUS_filename_is_key,
             content_keyed_md5=content_keyed_md5,
             equals=equals,
+            skip_if_path_exists=skip_if_path_exists,
+            template_cache_key=template_cache_key,
+            use_cache_symlink=use_cache_symlink,
         )
 
     def _repo_related(self, linkname: str, seen: Optional[Set[str]] = None) -> "repomodule.Repository":
@@ -774,6 +911,9 @@ class Task(ABC):
             seen = set()
         if linkname in seen:
             raise ValueError("Infinite recursion in repository related key lookup")
+        if not linkname in self.links:
+            raise ValueError(f"Task {self.name}: When trying to resolve related repositories, link {self.name}.{linkname} is not a valid link for this task. Check for incorrect `key:` parameters in the link definitions.")
+
         link = self.links[linkname]
         if link.kind == LinkKind.StreamingInputFilepath:
 
@@ -852,7 +992,10 @@ class Task(ABC):
             raise TypeError("Cannot do key lookup on repository which is not MetadataRepository")
 
         async def mapper(_job, info):
-            return str(supergetattr_path(info, splitkey[1:]))
+            try:
+                return str(supergetattr_path(info, splitkey[1:]))
+            except:
+                return ""
 
         mapped = related.map(mapper, [])
 
@@ -863,7 +1006,10 @@ class Task(ABC):
                 raise TypeError("Cannot do key lookup on repository which is not MetadataRepository")
 
             async def mapper2(_job, info):
-                return str(supergetattr_path(info, splitkey2[1:]))
+                try:
+                    return str(supergetattr_path(info, splitkey2[1:]))
+                except:
+                    return ""
 
             mapped2 = related2.map(mapper2, [])
         else:
@@ -902,6 +1048,12 @@ class Task(ABC):
         if self._ready is None:
             self._ready = self._make_ready()
         return self._ready
+
+    @property
+    def cancel(self) -> repomodule.Repository:
+        if self._cancel is None:
+            self._cancel = self._make_cancel()
+        return self._cancel
 
     @property
     def input(self):
@@ -968,7 +1120,7 @@ class Task(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def launch(self, job: str, replica: int):
+    async def launch(self, job: str, replica: int, reservation: QuotaReservation | None = None):
         """Launch a particular replica of a particular job.
 
         Override this to begin execution of the provided job/replica. Error handling will be done for you.
@@ -976,17 +1128,88 @@ class Task(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def kill(self, job: str, replica: int):
+    async def kill(self, job: str, replica: int | None):
         """Kill a particular replica of a particular job.
 
         If this is the last replica, don't populate done.
         """
         raise NotImplementedError
+    
+    async def collect_logs(self, job: str, replica: int | None):
+        pass
+
+    async def cancel_task(self, job: str, replica: int | None=None):
+        l.info("⏱️☠️ JOB CANCELLED! KILLING JOB %s:%s", self, job)
+        if os.getenv('ARTIPHISHELL_GLOBAL_ENV_COLLECT_LOGS_ON_CANCEL') == 'true':
+            await self.collect_logs(job, replica)
+        await self.kill(job, replica)
 
     @abstractmethod
     async def killall(self):
         """Kill all running jobs."""
         raise NotImplementedError
+
+    def is_containerset(self):
+        return False
+
+    async def render_template_cached(self, template, job, replica, env=None):
+        TIMEOUT = 60*15
+        cache_key = (template,job,replica)
+        now = int(time.time())
+        try:
+            if cache_key in self.__render_template_cache:
+                t, res = self.__render_template_cache[cache_key]
+                if t + TIMEOUT > now:
+                    del self.__render_template_cache[cache_key]
+                return res
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+        env, _, _ = await self.build_template_env_cached(job, replica, env)
+        res = await render_template(template, env)
+
+        try:
+            self.__render_template_cache[cache_key] = (now, res)
+            if len(self.__render_template_cache) > 1024:
+                for k,items in list(self.__render_template_cache.items()):
+                    t, res = items
+                    if t + TIMEOUT < now:
+                        del self.__render_template_cache[k]
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+        return res
+
+    async def build_template_env_cached(self, job, replica, env=None):
+        TIMEOUT = 60*15
+        cache_key = (job,replica)
+        now = int(time.time())
+        try:
+            if cache_key in self.__build_template_env_cache:
+                t, res = self.__build_template_env_cache[cache_key]
+                if t + TIMEOUT > now:
+                    del self.__build_template_env_cache[cache_key]
+                return res
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+        res = await self.build_template_env(job, replica)
+
+        try:
+            self.__build_template_env_cache[cache_key] = (now, res)
+            if len(self.__build_template_env_cache) > 1024:
+                for k,items in list(self.__build_template_env_cache.items()):
+                    t, res = items
+                    if t + TIMEOUT < now:
+                        del self.__build_template_env_cache[k]
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+        return res
 
     # This should almost certainly instead return a context manager returning a object wrapping the jinja environment,
     # the preamble, and the epilogue which cleans up the coroutines on close.
@@ -1014,7 +1237,7 @@ class Task(ABC):
                 try:
                     src = supergetattr(src, subkey)
                 except KeyError as e:
-                    raise Exception(f"Cannot access {'.'.join(items[:i+2])} during link subkeying") from e
+                    raise Exception(f"Cannot access {'.'.join(items[:i+2])} during link subkeying of {self.name}") from e
             return src
 
         preamble = []
@@ -1151,6 +1374,49 @@ class Task(ABC):
         else:
             return template
 
+    async def get_quota_for_job(
+        self,
+        job: str,
+        replica: int=-1,
+        env: Optional[Dict[str, Any]] = None,
+        pool: Optional[QuotaPool] = None,
+    ) -> Quota | None:
+        return None
+
+    async def get_resource_limits_for_job(
+        self,
+        job: str,
+        replica: int=-1,
+        env: Optional[Dict[str, Any]] = None,
+    ) -> Quota | None:
+        return None
+
+    async def get_max_concurrent_jobs(
+        self,
+        job: str,
+        env: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        if self.max_concurrent_jobs is None:
+            return None
+
+        if not isinstance(self.max_concurrent_jobs, _TemplateIntType):
+            return self.max_concurrent_jobs
+        
+        try:
+            template = str(self.max_concurrent_jobs)
+            
+
+            if env is None:
+                template_res = await self.render_template_cached(template, job, 0)
+            else:
+                template_res = await render_template(template, env)
+            return int(float(template_res)) # int(float(t)) allows for float truncation
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            l.error("Error rendering max_concurrent_jobs for %s: %s", self.name, e)
+            return None
 
 class TemplateShellTask(Task):
     """A task which templates a shell script to run."""
@@ -1165,6 +1431,7 @@ class TemplateShellTask(Task):
         replica: int,
         env_src: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], List[Any], List[Any]]:
+        # TODO can we cache this env? Can it change over time?
         env, preamble, epilogue = await super().build_template_env(orig_job, replica, env_src)
         NEWLINE = "\n"
         shutdown_script = self.mktemp("shutdown_script")
@@ -1192,11 +1459,34 @@ class TemplateShellTask(Task):
         preamble.insert(0, f"{NEWLINE.join(f'export {k}={v}' for k, v in self.global_script_env.items())}\n")
         preamble.insert(0, f"export PDT_AGENT_URL='{self.agent_url}'\n")
         preamble.insert(0, f"export PDT_AGENT_SECRET='{self.agent_secret}'\n")
-        preamble.insert(0, f"export NPROC_VAL='{int(math.ceil(self.job_quota.cpu))}'\n")
-        # microseconds per tenth of a second (linux CFS cpu-quota)
-        preamble.insert(0, f"export CPU_QUOTA='{int(self.job_quota.cpu * 100000)}'\n")
-        # bytes
-        preamble.insert(0, f"export MEM_QUOTA='{int(self.job_quota.mem)}'\n")
+        try:
+            pool = await QuotaPoolSet.get_pool_for_job_from_all_pools(None, self, orig_job, multiple_ok=True)
+            if isinstance(pool, list):
+                pool = pool[0]
+            job_quota = await self.get_quota_for_job(orig_job, replica=replica, env=env, pool=pool)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            job_quota = None
+
+        if job_quota is not None:
+            preamble.insert(0, f"export NPROC_VAL='{int(math.ceil(job_quota.cpu))}'\n")
+            # microseconds per tenth of a second (linux CFS cpu-quota)
+            preamble.insert(0, f"export CPU_QUOTA='{int(job_quota.cpu * 100000)}'\n")
+            # bytes
+            preamble.insert(0, f"export MEM_QUOTA='{int(job_quota.mem)}'\n")
+        
+        project_link = self.links.get('project_id')
+        if project_link and project_link.kind == LinkKind.InputId:
+            # Instead of trying to resolve it now, we will instead let the final template resolve it since we know this link exists
+            preamble.insert(0, "export PROJECT_ID='{{ project_id }}'\n")
+        else:
+            project_id_repo = self._repo_related('project_id')
+            if isinstance(project_id_repo, repomodule.RelatedItemRepository):
+                project_id = await project_id_repo._lookup(orig_job)
+            else:
+                project_id = orig_job
+            preamble.insert(0, f"export PROJECT_ID='{project_id}'\n")
         preamble.insert(0, f"export JOB_ID='{orig_job}'")
         preamble.insert(0, f"export TASK_NAME='{self.name}'")
         preamble.insert(0, f"export REPLICA_ID='{replica}'")
@@ -1269,10 +1559,11 @@ class KubeTask(TemplateShellTask):
     def __init__(
         self,
         name: str,
-        executor: "execmodule.Executor",
+        executor: execmodule.Executor,
         template: Union[str, Path],
-        logs: Optional["repomodule.BlobRepository"],
-        done: "repomodule.MetadataRepository",
+        logs: repomodule.BlobRepository | None,
+        done: repomodule.MetadataRepository,
+        extras: Optional[Dict[str, str]] = None,
         timeout: Optional[timedelta] = None,
         long_running: bool = False,
         template_env: Optional[Dict[str, Any]] = None,
@@ -1288,6 +1579,7 @@ class KubeTask(TemplateShellTask):
         :param executor: The executor to use for this task.
         :param quota: A QuotaManager instance. Tasks launched will contribute to its quota and be denied if they would
             break the quota.
+        :param extras: Optional: Additional values to save to the task's metadata.
         :param template: YAML markup for a pod manifest template, either as a string or a path to a file.
         :param logs: Optional: A BlobRepository to dump pod logs to on completion. Linked as "logs" with
             ``is_status``.
@@ -1309,6 +1601,7 @@ class KubeTask(TemplateShellTask):
             replicable=replicable,
             max_replicas=max_replicas,
             cache_dir=cache_dir,
+            extras=extras,
         )
 
         self.template = _read_template(template)
@@ -1333,14 +1626,51 @@ class KubeTask(TemplateShellTask):
                 is_status=True,
             )
 
-    def cache_flush(self):
-        super().cache_flush()
+    def cache_flush(self, soft=False):
+        super().cache_flush(soft=soft)
         if self._podman is not None:
-            self._podman.cache_flush()
+            self._podman.cache_flush(soft=soft)
 
     @property
     def host(self):
         return self.podman.host
+
+    @property
+    def quota_pools(self) -> QuotaPoolSet:
+        # Give it all quota pools as we don't support node selection yet
+        return self.podman.quota_pools
+
+    async def get_quota_for_job(
+        self,
+        job: str,
+        replica: int=-1,
+        env: Optional[Dict[str, Any]] = None,
+        pool: Optional[QuotaPool] = None,
+    ) -> Quota | None:
+        if not isinstance(self._job_quota, _TemplateQuotaType):
+            return self.job_quota
+
+        try:
+            quota_template = str(self._job_quota)
+
+            if env is None:
+                env, _, _ = await Task.build_template_env_cached(self, job, replica, {})
+
+            template_res = await render_template(quota_template, env)
+            yaml_data = yaml.load(template_res, Loader=yaml.CLoader)
+
+            from pydatatask.declarative import quota_constructor
+
+            quota = quota_constructor(yaml_data)
+
+            # Do not update the quota here, as we want to recalculate it for each job
+            return calculate_generic_job_quota(self, quota, update_quota=False, pool=pool)
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            l.error("Error parsing quota for job %s: %s", job, e)
+            return self.fallback_quota or Quota.parse(1, "1Gi")
 
     @property
     def job_quota(self):
@@ -1379,13 +1709,16 @@ class KubeTask(TemplateShellTask):
         template_env["argv0"] = os.path.basename(sys.argv[0])
         return template_env, preamble, epilogue
 
-    async def launch(self, job, replica):
+    async def launch(self, job, replica, **kwargs):
         template_env, preamble, epilogue = await self.build_template_env(job, replica)
         manifest = safe_load(await render_template(self.template, template_env))
         await self._test_auto_values(template_env)
         for item in template_env.values():
             if asyncio.iscoroutine(item):
                 item.close()
+
+        for k, v in self.extras.copy().items():
+            self.extras[k] = await render_template(v, template_env)
 
         assert manifest["kind"] == "Pod"
         spec = manifest["spec"]
@@ -1404,7 +1737,7 @@ class KubeTask(TemplateShellTask):
 
         await self.podman.launch(self.name, job, replica, manifest)
 
-    async def kill(self, job: str, replica: int):
+    async def kill(self, job: str, replica: int | None):
         await self.podman.kill(self.name, job, replica)
 
     async def killall(self):
@@ -1471,9 +1804,10 @@ class ProcessTask(TemplateShellTask):
         self,
         name: str,
         template: str,
-        done: "repomodule.MetadataRepository",
+        done: repomodule.MetadataRepository,
         executor: Optional[execmodule.Executor] = None,
-        job_quota: Union[Quota, _MaxQuotaType, None] = None,
+        job_quota: Union[Quota, _MaxQuotaType, _TemplateQuotaType, None] = None,
+        extras: Optional[Dict[str, str]] = None,
         timeout: Optional[timedelta] = None,
         environ: Optional[Dict[str, str]] = None,
         long_running: bool = False,
@@ -1493,6 +1827,7 @@ class ProcessTask(TemplateShellTask):
         :param job_quota: The amount of resources an individual job should contribute to the quota. Note that this
                               is currently **not enforced** target-side, so jobs may actually take up more resources
                               than assigned.
+        :param extras: Optional: Additional values to save to the task's metadata.
         :param timeout: The amount of time that a job may take before it is terminated, or None for no timeout.
         :param template: YAML markup for the template of a script to run, either as a string or a path to a file.
         :param environ: Additional environment variables to set on the target machine before running the task.
@@ -1519,6 +1854,7 @@ class ProcessTask(TemplateShellTask):
             long_running=long_running,
             timeout=timeout,
             queries=queries,
+            extras=extras,
             failure_ok=failure_ok,
             replicable=replicable,
             max_replicas=max_replicas,
@@ -1543,10 +1879,10 @@ class ProcessTask(TemplateShellTask):
         if isinstance(stderr, repomodule.BlobRepository):
             self.link("stderr", stderr, None, is_status=True)
 
-    def cache_flush(self):
-        super().cache_flush()
+    def cache_flush(self, soft=False):
+        super().cache_flush(soft=soft)
         if self._executor is not None:
-            self._executor.cache_flush()
+            self._executor.cache_flush(soft=soft)
 
     @property
     def host(self):
@@ -1554,20 +1890,12 @@ class ProcessTask(TemplateShellTask):
 
     @property
     def job_quota(self):
-        if isinstance(self._job_quota, _MaxQuotaType):
-            r = (self._max_quota or self.resource_limit) * self._job_quota
-        else:
-            r = copy.copy(self._job_quota)
-        if r.excess(self.resource_limit):
-            r = self.resource_limit * 0.9
-            l.warning(
-                "%s can never fit within the resource limits. Automatically adjusting its quota to %s",
-                self.name,
-                r,
+        if isinstance(self._job_quota, _TemplateQuotaType):
+            raise RuntimeError(
+                "Template quota cannot be resolved without a specific job. Use get_quota_for_job() instead."
             )
-            self._job_quota = r
-        return r
-
+        return calculate_generic_job_quota(self, self._job_quota)
+    
     @property
     def resource_limit(self):
         return self.manager.quota
@@ -1593,6 +1921,21 @@ class ProcessTask(TemplateShellTask):
     @property
     def _unique_stderr(self):
         return self._stderr is not None and not isinstance(self._stderr, _StderrIsStdout)
+
+    async def get_quota_for_job(
+        self,
+        job: str,
+        replica: int=-1,
+        env: Optional[Dict[str, Any]] = None,
+        pool: Optional[QuotaPool] = None,
+    ) -> Quota | None:
+        return self.job_quota
+
+    @property
+    def quota_pools(self) -> "QuotaPoolSet":
+        # We don't support node selection for process tasks
+        # This will probably only be the localhost quota pool
+        return self.manager.quota_pools
 
     async def update(self):
         live, reaped = await self.manager.update(self.name, self.timeout)
@@ -1652,13 +1995,16 @@ class ProcessTask(TemplateShellTask):
 
         return live, set(reaped), backoff
 
-    async def launch(self, job: str, replica: int):
+    async def launch(self, job: str, replica: int, reservation: Optional[QuotaReservation] = None):
         template_env, preamble, epilogue = await self.build_template_env(job, replica)
         exe_txt = await render_template(self.template, template_env)
         await self._test_auto_values(template_env)
         for item in template_env.values():
             if asyncio.iscoroutine(item):
                 item.close()
+
+        for k, v in self.extras.copy().items():
+            self.extras[k] = await render_template(v, template_env)
 
         exe = self.make_main_script(preamble, exe_txt, epilogue)
 
@@ -1733,6 +2079,10 @@ class InProcessSyncTask(Task):
         return Quota.parse(0, 0)
 
     @property
+    def quota_pools(self) -> "QuotaPoolSet":
+        return QuotaPoolSet.get_localhost_quota_pool()
+
+    @property
     def host(self):
         return LOCAL_HOST
 
@@ -1757,7 +2107,7 @@ class InProcessSyncTask(Task):
     async def update(self):
         return {}, set(), set()
 
-    async def launch(self, job: str, replica: int):
+    async def launch(self, job: str, replica: int, reservation: Optional[QuotaReservation] = None):
         assert replica == 0
         assert self.func is not None
         start_time = datetime.now(tz=timezone.utc)
@@ -1809,9 +2159,10 @@ class ExecutorTask(Task):
         self,
         name: str,
         executor: FuturesExecutor,
-        job_quota: Union[Quota, _MaxQuotaType],
+        job_quota: Union[Quota, _MaxQuotaType, _TemplateQuotaType],
         resource_limit: Quota,
         done: "repomodule.MetadataRepository",
+        extras: Optional[Dict[str, str]] = None,
         host: Optional[Host] = None,
         long_running: bool = False,
         ready: Optional["repomodule.Repository"] = None,
@@ -1827,7 +2178,7 @@ class ExecutorTask(Task):
         :param func: Optional: The async function to run as the task body, if you don't want to use this task as a
                      decorator.
         """
-        super().__init__(name, done, ready, long_running=long_running, failure_ok=failure_ok)
+        super().__init__(name, done, ready=ready, long_running=long_running, failure_ok=failure_ok, extras=extras)
 
         if host is None:
             if isinstance(executor, ThreadPoolExecutor):
@@ -1855,19 +2206,15 @@ class ExecutorTask(Task):
 
     @property
     def job_quota(self):
-        if isinstance(self._job_quota, _MaxQuotaType):
-            r = (self._max_quota or self.resource_limit) * self._job_quota
-        else:
-            r = copy.copy(self._job_quota)
-        if r.excess(self.resource_limit):
-            r = self.resource_limit * 0.9
-            l.warning(
-                "%s can never fit within the resource limits. Automatically adjusting its quota to %s",
-                self.name,
-                r,
+        if isinstance(self._job_quota, _TemplateQuotaType):
+            raise RuntimeError(
+                "Template quota cannot be resolved without a specific job. Use get_quota_for_job() instead."
             )
-            self._job_quota = r
-        return r
+        return calculate_generic_job_quota(self, self._job_quota)
+    
+    @property
+    def quota_pools(self) -> "QuotaPoolSet":
+        return QuotaPoolSet.get_localhost_quota_pool()
 
     @property
     def resource_limit(self):
@@ -1877,8 +2224,8 @@ class ExecutorTask(Task):
     def host(self):
         return self._host
 
-    async def kill(self, job: str, replica: int):
-        assert replica == 0
+    async def kill(self, job: str, replica: int | None):
+        assert replica == 0 or replica is None
         self.rev_jobs[job].cancel()
 
     async def killall(self):
@@ -1936,7 +2283,7 @@ class ExecutorTask(Task):
 
         await super().validate()
 
-    async def launch(self, job, replica):
+    async def launch(self, job: str, replica: int, reservation: Optional[QuotaReservation] = None):
         assert replica == 0
         l.info("Launching %s:%s with %s...", self.name, job, self.executor)
         args, preamble, epilogue = await self.build_template_env(job, replica)
@@ -2074,7 +2421,7 @@ class KubeFunctionTask(KubeTask):
 
         await super().validate()
 
-    async def launch(self, job: str, replica):
+    async def launch(self, job: str, replica, **kwargs):
         assert replica == 0
         if self.synchronous:
             await self._launch_sync(job)
@@ -2121,10 +2468,12 @@ class ContainerTask(TemplateShellTask):
         name: str,
         image: str,
         template: str,
-        done: "repomodule.MetadataRepository",
+        done: repomodule.MetadataRepository,
         executor: execmodule.Executor,
         entrypoint: Iterable[str] = ("/bin/sh", "-c"),
-        job_quota: Union[Quota, _MaxQuotaType, None] = None,
+        job_quota: Union[Quota, _MaxQuotaType, _TemplateQuotaType, None] = None,
+        resource_limits: Union[Quota, _MaxQuotaType, _TemplateQuotaType, None] = None,
+        extras: Optional[Dict[str, str]] = None,
         fallback_quota: Union[Quota, _MaxQuotaType, None] = None,
         timeout: Optional[timedelta] = None,
         environ: Optional[Dict[str, str]] = None,
@@ -2139,6 +2488,18 @@ class ContainerTask(TemplateShellTask):
         replicable: bool = False,
         max_replicas: Optional[int] = None,
         cache_dir: Optional[str] = None,
+        pod_labels: Optional[Dict[str, str]] = None,
+        node_labels: Optional[Dict[str, str]] = None,
+        node_labels_function: str | None = None,
+        node_taints: Optional[Dict[str, str]] = None,
+        node_affinity: Optional[Dict[str, str]] = None,
+        replica_node_labels: Optional[Dict[str, str]] = None,
+        replica_node_taints: Optional[Dict[str, str]] = None,
+        replica_node_affinity: Optional[Dict[str, str]] = None,
+        scale_replicas: bool = False,
+        starting_replicas: Optional[int] = None,
+        replicas_per_minute: Optional[int] = None,
+        wait_for_image_pull: bool = False,
     ):
         """
         :param name: The name of this task.
@@ -2147,6 +2508,7 @@ class ContainerTask(TemplateShellTask):
         :param job_quota: The amount of resources an individual job should contribute to the quota. Note that this
                               is currently **not enforced** target-side, so jobs may actually take up more resources
                               than assigned.
+        :param extras: Optional: Additional values to save to the task's metadata.
         :param template: YAML markup for the template of a script to run, either as a string or a path to a file.
         :param environ: Additional environment variables to set on the target container before running the task.
         :param timeout: How long a task can take before it is killed for taking too long, or None for no timeout.
@@ -2168,6 +2530,7 @@ class ContainerTask(TemplateShellTask):
             replicable=replicable,
             max_replicas=max_replicas,
             cache_dir=cache_dir,
+            extras=extras,
         )
 
         self.template = template
@@ -2176,6 +2539,7 @@ class ContainerTask(TemplateShellTask):
         self.environ = environ or {}
         self.logs = logs
         self._job_quota = job_quota or Quota.parse(1, "1Gi")
+        self._resource_limits = resource_limits or None
         self._fallback_quota = fallback_quota
         self._executor = executor
         self._manager: Optional[execmodule.AbstractContainerManager] = None
@@ -2183,7 +2547,18 @@ class ContainerTask(TemplateShellTask):
         self.privileged = privileged
         self.tty = tty
         self.mounts: Dict[str, str] = mounts or {}
-
+        self.pod_labels = pod_labels
+        self.node_labels = node_labels
+        self.node_labels_function = node_labels_function
+        self.node_taints = node_taints
+        self.node_affinity = node_affinity
+        self.replica_node_labels = replica_node_labels
+        self.replica_node_taints = replica_node_taints
+        self.replica_node_affinity = replica_node_affinity
+        self.scale_replicas = scale_replicas
+        self.starting_replicas = starting_replicas
+        self.replicas_per_minute = replicas_per_minute
+        self.wait_for_image_pull = wait_for_image_pull
         if logs is not None:
             self.link("logs", logs, None, is_status=True)
         self.link(
@@ -2194,41 +2569,150 @@ class ContainerTask(TemplateShellTask):
             inhibits_output=True,
         )
 
-    def cache_flush(self):
-        super().cache_flush()
+    def cache_flush(self, soft=False):
+        super().cache_flush(soft=soft)
         if self._executor is not None:
-            self._executor.cache_flush()
+            self._executor.cache_flush(soft=soft)
 
     @property
     def host(self):
         return self.manager.host
 
-    @property
-    def job_quota(self):
-        if isinstance(self._job_quota, _MaxQuotaType):
-            r = (self._max_quota or self.resource_limit) * self._job_quota
+    def _calculate_job_quota(self, quota: Quota | _MaxQuotaType, update_quota: bool = True, pool: Optional[QuotaPool] = None):
+        if pool:
+            limit = pool.get_quota_per_node()
         else:
-            r = copy.copy(self._job_quota)
-        if r.excess(self.resource_limit):
-            r = self.resource_limit * 0.9
+            limit = self.single_node_resource_limit
+        if not limit:
+            import traceback
+            traceback.print_stack()
+            l.warning(f"⚠️ No limit found for {self.name}, using localhost quota...")
+            limit = LOCALHOST_QUOTA
+
+        if isinstance(quota, _MaxQuotaType):
+            lower = (
+                self._max_quota
+                if self._max_quota and not self._max_quota.excess(limit)
+                else limit
+            )
+            r = lower * quota
+            if update_quota:
+                self._job_quota = r
+        else:
+            r = copy.copy(quota)
+
+        if r.excess(limit):
+            r = limit * 0.9
             l.warning(
                 "%s can never fit within the resource limits. Automatically adjusting its quota to %s",
                 self.name,
                 r,
             )
-            self._job_quota = r
+            if update_quota:
+                self._job_quota = r
         return r
+
+    async def get_resource_limits_for_job(self, job: str, replica: int=-1, env: Optional[Dict[str, Any]] = None) -> Quota | None:
+        if self._resource_limits is None:
+            return None
+        if not isinstance(self._resource_limits, _TemplateQuotaType):
+            # TODO should this be checked for max possible size for the box?
+            #      or just assume we know what we are doing when we set it
+            return self._resource_limits
+
+        try:
+            quota_template = str(self._resource_limits)
+
+            if env is None:
+                env, _, _ = await self.build_template_env_cached(job, replica)
+
+            if env is None:
+                template_res = await self.render_template_cached(quota_template, job, replica)
+            else:
+                template_res = await render_template(quota_template, env)
+            yaml_data = yaml.load(template_res, Loader=yaml.CLoader)
+
+            if not yaml_data or yaml_data is None:
+                return None
+
+            from pydatatask.declarative import quota_constructor
+
+            quota = quota_constructor(yaml_data)
+            if isinstance(quota, _TemplateQuotaType):
+                raise TypeError("HOLY WHAT ARE YOU DOING")
+            
+            return quota
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            l.error("Error parsing resource limits for job %s: %s", job, e)
+            return None
+
+    async def get_quota_for_job(
+        self,
+        job: str,
+        replica: int=-1,
+        env: Optional[Dict[str, Any]] = None,
+        pool: Optional[QuotaPool] = None,
+    ) -> Quota | None:
+        if not isinstance(self._job_quota, _TemplateQuotaType):
+            res = self._calculate_job_quota(self._job_quota, pool=pool)
+            return res
+
+        try:
+            quota_template = str(self._job_quota)
+
+            if env is None:
+                template_res = await self.render_template_cached(quota_template, job, replica)
+            else:
+                template_res = await render_template(quota_template, env)
+            yaml_data = yaml.load(template_res, Loader=yaml.CLoader)
+
+            from pydatatask.declarative import quota_constructor
+
+            quota = quota_constructor(yaml_data)
+            if isinstance(quota, _TemplateQuotaType):
+                raise TypeError("HOLY WHAT ARE YOU DOING")
+            
+            # Do not update the quota here, as we want to recalculate it for each job
+            return self._calculate_job_quota(quota, update_quota=False, pool=pool)
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            l.error("Error parsing quota for job %s: %s", job, e)
+            return self.fallback_quota or Quota.parse(1, "1Gi")
+
+    @property
+    def job_quota(self):
+        if isinstance(self._job_quota, _TemplateQuotaType):
+            raise RuntimeError(
+                "Template quota cannot be resolved without a specific job. Use get_quota_for_job() instead."
+            )
+        return self._calculate_job_quota(self._job_quota)
+
+    @property
+    def quota_pools(self) -> "QuotaPoolSet":
+        return self.manager.quota_pools
+
 
     @property
     def fallback_quota(self):
         if self._fallback_quota is None:
             return None
+        limit = self.single_node_resource_limit
         if isinstance(self._fallback_quota, _MaxQuotaType):
-            r = (self._max_quota or self.resource_limit) * self._fallback_quota
+            lower = (
+                self._max_quota
+                if self._max_quota and not self._max_quota.excess(limit)
+                else limit
+            )
+            r = lower * self._fallback_quota
         else:
             r = copy.copy(self._fallback_quota)
-        if r.excess(self.resource_limit):
-            r = self.resource_limit * 0.9
+        if r.excess(limit):
+            r = limit * 0.9
             l.warning(
                 "%s can never fit within the resource limits. Automatically adjusting its quota to %s",
                 self.name,
@@ -2242,6 +2726,14 @@ class ContainerTask(TemplateShellTask):
         return self.manager.quota
 
     @property
+    def single_node_resource_limit(self):
+        # This is the largest we could possibly run on a single node
+        # XXX This is not necessarily the largest avalible right now
+        #     ie you might ask for .5 of a node, but we have 2 nodes with .25 each
+        #     you will probably end up overprovisioning the node
+        return self.manager.single_node_quota
+
+    @property
     def manager(self) -> execmodule.AbstractContainerManager:
         """The process manager for this task.
 
@@ -2250,6 +2742,69 @@ class ContainerTask(TemplateShellTask):
         if self._manager is None:
             self._manager = self._executor.to_container_manager()
         return self._manager
+
+    async def collect_logs(self, job: str, replica: int | None):
+        if self.logs is None:
+            return None
+
+        logs = await self.manager.collect_logs(self.name, job, replica)
+
+        if len(logs) == 1:
+            (log,) = logs.values()
+        else:
+            log = b"".join(f">>> replica {k} <<<\n".encode() + v for k, v in logs.items() if v is not None)
+        if log and log.strip():
+            l.info(f"🪵🖊️ Writing {len(log)} bytes of logs for {self.name}:{job}:{replica}")
+            async with await self.logs.open(job, "ab") as fp:
+                await fp.write(log)
+
+        return None
+
+    async def cancel_task(self, job: str, replica: int | None=None):
+        l.info("⏱️☠️ JOB CANCELLED! KILLING JOB %s:%s", self, job)
+        try:
+            now = datetime.now(tz=timezone.utc)
+            try:
+                live = await self.manager.live(self.name, job, 0)
+                if live and len(live) > 0:
+                    done = {
+                        "success": True if self.long_running else False,
+                        "start_time": next(iter(live.values()), None),
+                        "end_time": now,
+                        "timeout": True,
+                        "reason": "Task Cancelled",
+                        "image": None
+                    }
+                    l.info(f"Marking job {self.name}:{job} as done")
+                    await self.done.dump(job, done)
+                else:
+                    l.info(f"Job {self.name}:{job} is not live")
+            except:
+                import traceback
+                traceback.print_exc()
+                l.error(f"Error getting live for {self.name}:{job}:{replica}")
+                live = {}
+        except:
+            import traceback
+            traceback.print_exc()
+            l.error(f"Error marking job {self.name}:{job} as done")
+
+        try:
+            await self.collect_logs(job, None)
+        except:
+            import traceback
+            traceback.print_exc()
+            l.error(f"Error collecting logs for {self.name}:{job}")
+
+        try:
+            await self.kill(job, replica)
+        except:
+            import traceback
+            traceback.print_exc()
+            l.error(f"Error killing {self.name}:{job}")
+
+
+
 
     async def update(self):
         live, reaped = await self.manager.update(self.name, timeout=self.timeout)
@@ -2299,18 +2854,41 @@ class ContainerTask(TemplateShellTask):
 
         return live, set(reaped), backoff
 
-    async def launch(self, job: str, replica: int):
+    async def launch(self, job: str, replica: int, reservation: Optional[QuotaReservation] = None):
         template_env, preamble, epilogue = await self.build_template_env(job, replica)
+        preamble_rendered = []
+        for p in preamble:
+            if isinstance(p, str) and (
+                '{{' in p or '{%' in p
+            ):
+                preamble_rendered.append(await render_template(p, template_env))
+            else:
+                preamble_rendered.append(p)
         exe_txt = await render_template(self.template, template_env)
         image = await render_template(self.image, template_env)
+        mounts = self.mounts.copy()
+        new_mounts = {}
+        for k, v in mounts.items():
+            k = await render_template(k, template_env)
+            v = await render_template(v, template_env)
+            new_mounts[k] = v
+        mounts = new_mounts
+
+        for k, v in self.extras.copy().items():
+            self.extras[k] = await render_template(v, template_env)
+
         await self._test_auto_values(template_env)
-        exe_txt = self.make_main_script(preamble, exe_txt, epilogue)
+        exe_txt = self.make_main_script(preamble_rendered, exe_txt, epilogue)
         for item in template_env.values():
             if asyncio.iscoroutine(item):
                 item.close()
 
         privileged = bool(self.privileged)
         tty = bool(self.tty)
+        the_quota = reservation.quota if reservation else await self.get_quota_for_job(job, replica=replica)
+        if the_quota is None:
+            raise TypeError("You can't be doing that white baby")
+        resource_limits = await self.get_resource_limits_for_job(job, replica=replica)
         await self.manager.launch(
             self.name,
             job,
@@ -2319,10 +2897,13 @@ class ContainerTask(TemplateShellTask):
             list(self.entrypoint),
             exe_txt,
             self.environ,
-            self.job_quota,
-            self.mounts,
+            the_quota,
+            resource_limits,
+            mounts,
             privileged,
             tty,
+            reservation=reservation,
+            wait_for_image_pull=self.wait_for_image_pull,
         )
 
     async def kill(self, job, replica):
@@ -2343,13 +2924,15 @@ class ContainerSetTask(TemplateShellTask):
         done: "repomodule.MetadataRepository",
         executor: execmodule.Executor,
         entrypoint: Iterable[str] = ("/bin/sh", "-c"),
-        job_quota: Union[Quota, _MaxQuotaType, None] = None,
+        job_quota: Union[Quota, _MaxQuotaType, _TemplateQuotaType, None] = None,
+        resource_limits: Union[Quota, _MaxQuotaType, _TemplateQuotaType, None] = None,
+        extras: Optional[Dict[str, str]] = None,
         timeout: Optional[timedelta] = None,
         environ: Optional[Dict[str, str]] = None,
         mounts: Optional[Dict[str, str]] = None,
         long_running: bool = False,
-        logs: Optional["repomodule.BlobRepository"] = None,
-        ready: Optional["repomodule.Repository"] = None,
+        logs: repomodule.BlobRepository | None = None,
+        ready: repomodule.Repository | None = None,
         privileged: Optional[bool] = False,
         tty: Optional[bool] = False,
         queries: Optional[Dict[str, pydatatask.query.query.Query]] = None,
@@ -2357,6 +2940,18 @@ class ContainerSetTask(TemplateShellTask):
         replicable: bool = False,
         max_replicas: Optional[int] = None,
         cache_dir: Optional[str] = None,
+        pod_labels: Optional[Dict[str, str]] = None,
+        node_labels: Optional[Dict[str, str]] = None,
+        node_labels_function: str | None = None,
+        node_taints: Optional[Dict[str, str]] = None,
+        node_affinity: Optional[Dict[str, str]] = None,
+        replica_node_labels: Optional[Dict[str, str]] = None,
+        replica_node_taints: Optional[Dict[str, str]] = None,
+        replica_node_affinity: Optional[Dict[str, str]] = None,
+        scale_replicas: bool = False,
+        starting_replicas: Optional[int] = None,
+        replicas_per_minute: Optional[int] = None,
+        wait_for_image_pull: bool = False,
     ):
         super().__init__(
             name,
@@ -2369,16 +2964,21 @@ class ContainerSetTask(TemplateShellTask):
             replicable=replicable,
             max_replicas=max_replicas,
             cache_dir=cache_dir,
+            extras=extras,
         )
+        if scale_replicas:
+            raise NotImplementedError("ContainerSetTask does not support scale_replicas")
 
         if not long_running:
             raise Exception("ContainerSetTask MUST be long running")
+            
         self.template = template
         self.entrypoint = entrypoint
         self.image = image
         self.environ = environ or {}
         self.logs = logs
         self._job_quota = job_quota or Quota.parse(1, "1Gi")
+        self._resource_limits = resource_limits or None
         self._executor = executor
         self._manager: Optional[execmodule.AbstractContainerSetManager] = None
         self.warned = False
@@ -2386,6 +2986,18 @@ class ContainerSetTask(TemplateShellTask):
         self.tty = tty
         self.mounts: Dict[str, str] = mounts or {}
         self._node_count = None
+        self.pod_labels = pod_labels
+        self.node_labels = node_labels
+        self.node_labels_function = node_labels_function
+        self.node_taints = node_taints
+        self.node_affinity = node_affinity
+        self.replica_node_labels = replica_node_labels
+        self.replica_node_taints = replica_node_taints
+        self.replica_node_affinity = replica_node_affinity
+        self.scale_replicas = scale_replicas
+        self.starting_replicas = starting_replicas
+        self.replicas_per_minute = replicas_per_minute
+        self.wait_for_image_pull = wait_for_image_pull
 
         if logs is not None:
             self.link("logs", logs, None, is_status=True)
@@ -2397,43 +3009,139 @@ class ContainerSetTask(TemplateShellTask):
             inhibits_output=True,
         )
 
+    def is_containerset(self):
+        return True
+
     async def validate(self):
         self._node_count = await self.manager.size()
 
     @property
     def node_count(self):
-        if self._node_count is None:
-            raise Exception("Pipeline is not open")
-        return self._node_count
+        return self.quota_pools.node_count
 
-    def cache_flush(self):
-        super().cache_flush()
+    def cache_flush(self, soft=False):
+        super().cache_flush(soft=soft)
         if self._executor is not None:
-            self._executor.cache_flush()
+            self._executor.cache_flush(soft=soft)
 
     @property
     def host(self):
         return self.manager.host
 
+    async def get_quota_for_job_per_container(
+        self,
+        job: str,
+        env: Optional[Dict[str, Any]] = None,
+        pool: Optional[QuotaPool] = None,
+    ):
+        return self.job_quota
+
+    async def get_resource_limits_for_job(self, job: str, replica: int=-1, env: Optional[Dict[str, Any]] = None) -> Quota | None:
+        if self._resource_limits is None:
+            return None
+        if not isinstance(self._resource_limits, _TemplateQuotaType):
+            # TODO should this be checked for max possible size for the box?
+            #      or just assume we know what we are doing when we set it
+            return self._resource_limits
+
+        try:
+            quota_template = str(self._resource_limits)
+
+            if env is None:
+                template_res = await self.render_template_cached(quota_template, job, replica)
+            else:
+                template_res = await render_template(quota_template, env)
+            yaml_data = yaml.load(template_res, Loader=yaml.CLoader)
+
+            if not yaml_data or yaml_data is None:
+                return None
+
+            from pydatatask.declarative import quota_constructor
+
+            quota = quota_constructor(yaml_data)
+            if isinstance(quota, _TemplateQuotaType):
+                raise TypeError("HOLY WHAT ARE YOU DOING")
+            
+            return quota
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            l.error("Error parsing resource limits for job %s: %s", job, e)
+            return None
+
+    async def get_quota_for_job(
+        self,
+        job: str,
+        replica: int=-1,
+        env: Optional[Dict[str, Any]] = None,
+        pool: Optional[QuotaPool] = None,
+    ):
+        if not isinstance(self._job_quota, _TemplateQuotaType):
+            node_count = 1
+            if pool:
+                node_count = pool.node_count
+            # HISTORICAL CONTEXT:
+            # [IN THE PAST] PDT did the following for containersets:
+            # - The ContainerSetTask is given a fixed quota for all copies cummulatively
+            # - When launched, each container would be a fraction of that total job quota
+            # - So the `self.job_quota` would return that fixed amount dividied by the number of nodes currently available
+            # THUS when trying to determine the overall quota for this job, it would re-multiply by the number of nodes to get back the original quota (or more if there is more nodes than at launch)
+
+            # BUT when we changed PDT to work with auto-scaling quota pools, this logic no longer makes sense, as a very large pool could cause this job to have no resources at all, crash looping it. (we have had > 100 nodes at once)
+
+            # SO now each instances of this ContainerSets will each spawn with a fixed size which is equal to `self.job_quota`, and the overall impact to the quota is multiplied by the number of nodes it in its pool
+
+            # HOWEVER when we launch each container, we should only use self.get_quota_for_job_per_container(...) which returns self.job_quota which is the per-container quota, rather than the value from here.
+            
+            res = self.job_quota * node_count
+            return res
+
+        raise NotImplementedError("ContainerSetTask does not support template quotas")
+    
+    @property
+    def quota_pools(self) -> "QuotaPoolSet":
+        return self.manager.quota_pools
+
     @property
     def job_quota(self):
+        # For container sets, we will copy this quota to each node
+        # Rather than dividing it across nodes, we will just return the single node request
+        # The cross node calculation will be handled by the QuotaPools
+        if isinstance(self._job_quota, _TemplateQuotaType):
+            raise RuntimeError("Template quota cannot be resolved without a specific job. Use get_quota_for_job() instead.")
+
+        quota_pools = self.quota_pools
+        limit = quota_pools.single_node_resource_limit
+
         if isinstance(self._job_quota, _MaxQuotaType):
-            r = (self._max_quota or self.resource_limit) * self._job_quota
+            lower = (
+                self._max_quota
+                if self._max_quota and not self._max_quota.excess(limit)
+                else limit
+            )
+            r = lower * self._job_quota
+
         else:
             r = copy.copy(self._job_quota)
-        if (r * self.node_count).excess(self.resource_limit):
-            r = self.resource_limit * (0.9 / self.node_count)
+
+        if r.excess(limit):
+            r = limit * 0.9
             l.warning(
                 "%s can never fit within the resource limits. Automatically adjusting its quota to %s",
                 self.name,
                 r,
             )
             self._job_quota = r
-        return r * self.node_count
+        return r
 
     @property
     def resource_limit(self):
         return self.manager.quota
+
+    @property
+    def single_node_resource_limit(self):
+        return self.quota_pools.single_node_resource_limit
 
     @property
     def manager(self) -> execmodule.AbstractContainerSetManager:
@@ -2444,6 +3152,64 @@ class ContainerSetTask(TemplateShellTask):
         if self._manager is None:
             self._manager = self._executor.to_container_set_manager()
         return self._manager
+
+    async def cancel_task(self, job: str, replica: int | None=None):
+        l.info("⏱️☠️ JOB CANCELLED! KILLING JOB %s:%s", self, job)
+        try:
+            if self.done is not None and not await self.done.contains(job):
+                now = datetime.now(tz=timezone.utc)
+                try:
+                    live = await self.manager.live(self.name, job)
+                except:
+                    import traceback
+                    traceback.print_exc()
+                    l.error(f"Error getting live for {self.name}:{job}:{replica}")
+                    live = {}
+
+                done = {
+                    "success": True if self.long_running else False,
+                    "start_time": next(iter(live.values()), None),
+                    "end_time": now,
+                    "timeout": True,
+                    "reason": "Task Cancelled",
+                    "image": None
+                }
+                await self.done.dump(job, done)
+        except:
+            import traceback
+            traceback.print_exc()
+            l.error(f"Error marking job {self.name}:{job} as done")
+
+        try:
+            await self.collect_logs(job, None)
+        except:
+            import traceback
+            traceback.print_exc()
+            l.error(f"Error collecting logs for {self.name}:{job}")
+
+        try:
+            await self.kill(job, replica)
+        except:
+            import traceback
+            traceback.print_exc()
+            l.error(f"Error killing {self.name}:{job}")
+
+    async def collect_logs(self, job: str, replica: int | None):
+        if self.logs is None:
+            return None
+
+        logs = await self.manager.collect_logs(self.name, job, replica)
+        if len(logs) == 1:
+            (log,) = logs.values()
+        else:
+            log = b"".join(f">>> replica {k} <<<\n".encode() + v for k, v in logs.items() if v is not None)
+
+        if log and log.strip():
+            l.info(f"🪵🖊️ Writing {len(log)} bytes of logs for {self.name}:{job}:{replica}")
+            async with await self.logs.open(job, "ab") as fp:
+                await fp.write(log)
+
+        return None
 
     async def update(self):
         live, reaped = await self.manager.update(self.name, timeout=self.timeout)
@@ -2493,18 +3259,42 @@ class ContainerSetTask(TemplateShellTask):
 
         return live, set(reaped), backoff
 
-    async def launch(self, job: str, replica: int):
+    async def launch(self, job: str, replica: int, reservation: Optional[QuotaReservation] = None):
         template_env, preamble, epilogue = await self.build_template_env(job, replica)
+        preamble_rendered = []
+        for p in preamble:
+            if isinstance(p, str) and (
+                '{{' in p or '{%' in p
+            ):
+                preamble_rendered.append(await render_template(p, template_env))
+            else:
+                preamble_rendered.append(p)
+
         exe_txt = await render_template(self.template, template_env)
         image = await render_template(self.image, template_env)
         await self._test_auto_values(template_env)
-        exe_txt = self.make_main_script(preamble, exe_txt, epilogue)
+        exe_txt = self.make_main_script(preamble_rendered, exe_txt, epilogue)
+
+        mounts = self.mounts.copy()
+        for k, v in mounts.items():
+            k = await render_template(k, template_env)
+            v = await render_template(v, template_env)
+            mounts[k] = v
+
+        for k, v in self.extras.copy().items():
+            self.extras[k] = await render_template(v, template_env)
+
         for item in template_env.values():
             if asyncio.iscoroutine(item):
                 item.close()
 
         privileged = bool(self.privileged)
         tty = bool(self.tty)
+        per_container_quota = await self.get_quota_for_job_per_container(job)
+        if reservation and not reservation.quota_per_instance.excess(per_container_quota):
+            per_container_quota = reservation.quota_per_instance
+        resource_limits = await self.get_resource_limits_for_job(job, replica=replica)
+
         await self.manager.launch(
             self.name,
             job,
@@ -2513,10 +3303,13 @@ class ContainerSetTask(TemplateShellTask):
             list(self.entrypoint),
             exe_txt,
             self.environ,
-            self.job_quota * (1 / self.node_count),
-            self.mounts,
+            per_container_quota,
+            resource_limits,
+            mounts,
             privileged,
             tty,
+            reservation=reservation,
+            wait_for_image_pull=self.wait_for_image_pull,
         )
 
     async def kill(self, job, replica):

@@ -4,8 +4,7 @@ The cool part here is that you are not restricted in the way your data is stored
 
 Installing
 ----------
-``sudo apt-get install graphviz-dev``
-``sudo apt install graphviz``
+
 ``pip install pydatatask``
 
 Nomenclature

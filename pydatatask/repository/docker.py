@@ -82,7 +82,7 @@ class DockerRepository(Repository):
         }
 
     def _dxf_auth(self, dxf_obj, response):
-        # what a fucking hack
+        # what a forking hack
         assert self.registry.credentials is not None
         for pattern, credentials in self.registry.credentials.items():
             if pattern.fullmatch(self.domain):

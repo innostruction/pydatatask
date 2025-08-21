@@ -15,9 +15,13 @@ from pydatatask.executor.container_manager import (
     KubeContainerManager,
 )
 from pydatatask.host import LOCAL_HOST, Host
-from pydatatask.quota import Quota
+from pydatatask.quota import Quota, QuotaPoolSet, QuotaReservation
 from pydatatask.session import Ephemeral
 
+import logging
+import aiohttp
+
+l = logging.getLogger(__name__)
 
 class AbstractContainerSetManager(Executor):
     def __init__(self, quota: Quota, *, image_prefix: str = ""):
@@ -41,9 +45,11 @@ class AbstractContainerSetManager(Executor):
         cmd: str,
         environ: Dict[str, str],
         quota: Quota,
+        resource_limits: Quota | None,
         mounts: Dict[str, str],
         privileged: bool,
         tty: bool,
+        **kwargs,
     ):
         """Launch a container set with the given parameters.
 
@@ -60,7 +66,7 @@ class AbstractContainerSetManager(Executor):
         raise NotImplementedError
 
     @abstractmethod
-    async def kill(self, task: str, job: str, replica: int):
+    async def kill(self, task: str, job: str, replica: int | None):
         """Kill the container set associated with the given task and job and replica.
 
         This does not need to be done gracefully by any stretch. It should wipe any resources associated with the job,
@@ -85,6 +91,13 @@ class AbstractContainerSetManager(Executor):
         live jobs.
         """
         raise NotImplementedError
+
+    @property
+    def single_node_quota(self) -> Quota:
+        return self.quota
+
+    async def collect_logs(self, task: str, job: str, replica: int | None) -> Dict[int, bytes]:
+        return {}
 
 
 class DockerContainerSetManager(AbstractContainerSetManager):
@@ -115,8 +128,8 @@ class DockerContainerSetManager(AbstractContainerSetManager):
     def host(self):
         return self._docker_manager.host
 
-    def cache_flush(self):
-        self._docker_manager.cache_flush()
+    def cache_flush(self, soft=False):
+        self._docker_manager.cache_flush(soft=soft)
 
     async def launch(
         self,
@@ -128,18 +141,20 @@ class DockerContainerSetManager(AbstractContainerSetManager):
         cmd: str,
         environ: Dict[str, str],
         quota: Quota,
+        resource_limits: Quota | None,
         mounts: Dict[str, str],
         privileged: bool,
         tty: bool,
+        **kwargs,
     ):
         return await self._docker_manager.launch(
-            task, job, replica, image, entrypoint, cmd, environ, quota, mounts, privileged, tty
+            task, job, replica, image, entrypoint, cmd, environ, quota, resource_limits, mounts, privileged, tty
         )
 
     async def live(self, task: str, job: Optional[str] = None) -> Dict[Tuple[str, int], datetime]:
         return await self._docker_manager.live(task, job)
 
-    async def kill(self, task: str, job: str, replica: int):
+    async def kill(self, task: str, job: str, replica: int | None):
         return await self._docker_manager.kill(task, job, replica)
 
     async def update(
@@ -159,7 +174,7 @@ class KubeContainerSetManager(AbstractContainerSetManager):
         self._lock = asyncio.Lock()
 
     async def size(self):
-        return len((await self.v1.list_node()).items)
+        return len(await self.inner.cluster.get_nodes())
 
     @property
     def connection(self) -> pod_manager.KubeConnection:
@@ -194,12 +209,11 @@ class KubeContainerSetManager(AbstractContainerSetManager):
         """A CoreV1Api instance associated with the current API client."""
         return self.connection.v1apps
 
+
     async def query(self, job=None, task=None, replica=None) -> List[Any]:
         async with self._lock:
             if self._cached_ds is None:
-                self._cached_ds = (
-                    await self.v1apps.list_namespaced_daemon_set(self.namespace, label_selector=f"app={self.app}")
-                ).items
+                self._cached_ds = await self.inner.cluster._list_namespaced_daemonsets(f"app={self.app}")
 
         assert self._cached_ds is not None
         return [
@@ -210,27 +224,27 @@ class KubeContainerSetManager(AbstractContainerSetManager):
             and (replica is None or ds.metadata.labels["replica"] == str(replica))
         ]
 
-    async def delete(self, ds: Any):
+    async def delete(self, ds: Any, max_retries: int = 10):
         """Destroy the given ds."""
         try:
-            await self.v1.delete_namespaced_daemon_set(ds.metadata.name, self.namespace)
+            await self.inner.cluster._delete_namespaced_daemon_set(ds.metadata.name, max_retries)
         except ApiException:
             pass
 
-    async def logs(self, ds: Any, timeout=10) -> bytes:
+    async def logs(self, ds: Any, timeout=30) -> bytes:
         """Retrieve the logs for the given ds."""
         nonce = ds.spec.selector.match_labels["daemonset"]
-        pods = await self.v1.list_namespaced_pod(self.namespace, label_selector=f"daemonset={nonce}")
+        pods = await self.inner.cluster._list_namespaced_pods(f"daemonset={nonce}", max_retries=0)
         all_logs = await asyncio.gather(
             *(
-                self.v1.read_namespaced_pod_log(pod.metadata.name, self.namespace, _request_timeout=timeout)
-                for pod in pods.items
+                self.inner.cluster._read_namespaced_pod_log(pod.metadata.name, timeout, max_retries=0)
+                for pod in pods
             )
         )
-        return "\n".join(f"==> {pod.status.host_ip} <==\n" + log for pod, log in zip(pods.items, all_logs)).encode()
+        return "\n".join(f"==> {pod.status.host_ip} <==\n" + log for pod, log in zip(pods, all_logs)).encode()
 
-    def cache_flush(self):
-        self.inner.cache_flush()
+    def cache_flush(self, soft=False):
+        self.inner.cache_flush(soft=soft)
         self._cached_ds = None
 
     async def launch(
@@ -243,17 +257,26 @@ class KubeContainerSetManager(AbstractContainerSetManager):
         cmd: str,
         environ: Dict[str, str],
         quota: Quota,
+        resource_limits: Quota | None,
         mounts: Dict[str, str],
         privileged: bool,
         tty: bool,
+        reservation: Optional[QuotaReservation] = None,
+        wait_for_image_pull: bool = False,
+        **kwargs,
     ):
-        pod_spec = self.inner.build_pod_spec(image, entrypoint, cmd, environ, quota, mounts, privileged, tty)
+        pod_spec = self.inner.build_pod_spec(image, entrypoint, cmd, environ, quota, resource_limits, mounts, privileged, tty, reservation, wait_for_image_pull=wait_for_image_pull)
         pod_spec["restartPolicy"] = "Always"
+        pod_spec["priorityClassName"] = "high-priority"
         nonce = "".join(random.choice(string.ascii_lowercase) for _ in range(8))
         pod_template = {
             "metadata": {
                 "labels": {
                     "daemonset": nonce,
+                    "app": self.app,
+                    "task": task,
+                    "job": job,
+                    "replica": str(replica),
                 },
             },
             "spec": pod_spec,
@@ -280,14 +303,24 @@ class KubeContainerSetManager(AbstractContainerSetManager):
             },
         }
 
-        await self.v1apps.create_namespaced_daemon_set(self.namespace, ds)
+        await self.inner.cluster._create_namespaced_daemon_set(ds)
 
     def _id_to_name(self, task: str, job: str, replica: int) -> str:
+        if replica is None:
+            replica = '0'
         task = task.replace("_", "-")
         return f"{self.app}-{task}-{job}-{replica}"
 
     def _ds_to_id(self, ds: Any) -> Tuple[str, int]:
         return ds.metadata.labels["job"], int(ds.metadata.labels["replica"])
+
+    async def collect_logs(self, task: str, job: str, replica: int | None) -> Dict[int, bytes]:
+        ds = await self.query(job, task, replica)
+        results = await asyncio.gather(*(self.logs(ds) for ds in ds))
+        final: Dict[int, bytes] = {}
+        for ds, result in zip(ds, results):
+            final[int(ds.metadata.labels["replica"])] = result
+        return final
 
     async def update(
         self, task: str, timeout: Optional[timedelta] = None
@@ -320,28 +353,37 @@ class KubeContainerSetManager(AbstractContainerSetManager):
         async def io_guy(name) -> Optional[bytes]:
             try:
                 return await self.logs(dsmap[name])
-            except (TimeoutError, ApiException):
+            except (TimeoutError, ApiException, Exception):
                 return None
 
-        logs = await asyncio.gather(*(io_guy(name) for name in dead if name[0] not in live_jobs))
+        logs = await asyncio.gather(
+            *(io_guy(name) for name in dead if name[0] not in live_jobs),
+            return_exceptions=True,
+        )
         await asyncio.gather(
-            *(self.v1apps.delete_namespaced_daemon_set(dsmap[name].metadata.name, self.namespace) for name in dead),
+            *(self.inner.cluster._delete_namespaced_daemon_set(dsmap[name].metadata.name) for name in dead),
             return_exceptions=True,
         )
 
         live_result = {name: dsmap[name].metadata.creation_timestamp for name in live}
         reap_result: DefaultDict[str, Dict[int, Tuple[Optional[bytes], Dict[str, Any]]]] = defaultdict(dict)
         for name, log in zip(dead, logs):
+            if isinstance(log, Exception) or log is None:
+                log = b"<Timeout or other error retrieving logs>"
+
             job, replica = name
             if job not in live_jobs:
                 reap_result[job][replica] = (log, gen_done(dsmap[name]))
 
         return live_result, dict(reap_result)
 
-    async def kill(self, task: str, job: str, replica: int):
+    async def kill(self, task: str, job: str, replica: int | None):
         """Killllllllllllll."""
+        d_id = self._id_to_name(task, job, replica or 0)
+        l.debug(f"💀👿 Killing daemonset: {d_id}")
+
         try:
-            await self.v1apps.delete_namespaced_daemon_set(self._id_to_name(task, job, replica), self.namespace)
+            await self.inner.cluster._delete_namespaced_daemon_set(d_id)
         except ApiException:
             pass
 
@@ -352,3 +394,7 @@ class KubeContainerSetManager(AbstractContainerSetManager):
     @property
     def host(self):
         return self.inner.host
+
+    @property
+    def quota_pools(self) -> "QuotaPoolSet":
+        return self.inner.quota_pools

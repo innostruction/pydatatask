@@ -102,7 +102,7 @@ class RepoDir(Directory):
             assert isinstance(self.repo, repomodule.MetadataRepository)
             if not data_bytes:
                 # we are PROBABLY doing open(x, O_TRUNC)
-                # do not sync this. nobody wants the empty string to be valid yaml. fuck you
+                # do not sync this. nobody wants the empty string to be valid yaml. fork you
                 return
             data = safe_load(bytes(data_bytes))
             await self.repo.dump(job, data)

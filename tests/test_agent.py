@@ -48,7 +48,7 @@ class TestAgent(unittest.IsolatedAsyncioTestCase):
                 assert "KeyError" in text
 
             with open("/tmp/scroingle", "w") as fp:
-                fp.write("{holy fucking bingle")
+                fp.write("{holy hecking bingle")
             script = task.mk_repo_put("/tmp/scroingle", "done", "1")
             p = await asyncio.create_subprocess_shell(
                 script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE

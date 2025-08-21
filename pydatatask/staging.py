@@ -29,6 +29,7 @@ import os
 import random
 import subprocess
 
+from importlib_metadata import entry_points
 import yaml
 
 from pydatatask.declarative import (
@@ -46,7 +47,7 @@ from pydatatask.quota import Quota
 from pydatatask.repository import Repository
 from pydatatask.session import Ephemeral, Session
 from pydatatask.utils import safe_load
-
+from pydatatask.task import Task, render_template
 if TYPE_CHECKING:
     from dataclasses import dataclass as _dataclass_serial  # pylint: disable=reimported
 else:
@@ -112,6 +113,9 @@ class LinkSpec:
     DANGEROUS_filename_is_key: Optional[bool] = None
     content_keyed_md5: Optional[bool] = None
     equals: Optional[str] = None
+    skip_if_path_exists: Optional[str] = None
+    template_cache_key: Optional[str] = None
+    use_cache_symlink: Optional[bool] = False
 
 
 @_dataclass_serial
@@ -135,17 +139,33 @@ class TaskSpec:
     timeout: Dict[str, str] = field(default_factory=dict)
     long_running: bool = False
     job_quota: Optional[Quota] = None
+    resource_limits: Optional[Quota] = None
+    extras: Optional[Dict[str, str]] = field(default_factory=dict)
     failure_ok: bool = False
     replicable: bool = False
     max_replicas: Optional[int] = None
     require_success: bool = False
     priority_factor: Optional[float] = None
-    priority_addend: Optional[int] = None
-    priority: float = 0.0
+    priority_addend: Optional[Union[int, str]] = None
+    priority: Union[float, str] = 0.0
+    priority_function: str | None = None
     max_concurrent_jobs: Optional[int] = None
     max_spawn_jobs: int = 100
     max_spawn_jobs_period: Dict[str, Union[str, int]] = field(default_factory=lambda: {"minutes": 1})
     cache_dir: Optional[str] = None
+    pod_labels: Optional[Dict[str, str]] = None
+    node_labels: Optional[Dict[str, str]] = None
+    node_labels_function: str | None = None
+    node_taints: Optional[Dict[str, str]] = None
+    node_affinity: Optional[Dict[str, str]] = None
+    replica_node_labels: Optional[Dict[str, str]] = None
+    replica_node_taints: Optional[Dict[str, str]] = None
+    replica_node_affinity: Optional[Dict[str, str]] = None
+    scale_replicas: bool = False
+    starting_replicas: Optional[int] = None
+    replicas_per_minute: Optional[int] = None
+    wait_for_image_pull: bool = False
+
 
 
 @_dataclass_serial
@@ -251,6 +271,7 @@ class RepoClassSpec:
     mimetype: str = "application/octet-stream"
     required: bool = True
     name: Optional[str] = None
+    annotations: Optional[Dict[str,str]] = None
 
 
 @_dataclass_serial
@@ -381,10 +402,15 @@ class PipelineChild:
     pipeline: "PipelineStaging"
     repo_translation: Dict[str, str] = field(default_factory=dict)  # {imp name: {our name: child's name}}
 
+from functools import lru_cache
+
+@lru_cache(maxsize=None)
+def get_priority_function(function_name: str):
+    eps = entry_points(group="pydatatask.priority_functions")
+    ep = eps[function_name]  # newer api, or use eps.get(function_name)
+    return ep.load()
 
 # pylint: enable=missing-class-docstring,missing-function-docstring
-
-
 class PipelineStaging:
     """The main manager for pipeline.yaml files.
 
@@ -444,7 +470,7 @@ class PipelineStaging:
                 if k in self.spec.repo_classes:
                     v2 = self.spec.repo_classes[k]
                     if v.cls != v2.cls:
-                        raise ValueError(f"Disagreement on repo class for {k} in {self.filename}")
+                        raise ValueError(f"Disagreement on repo class for {k} in {self.filename}: {v.cls}(from parent) != {v2.cls}: {self.basedir / self.filename}")
                     if v.schema is not None and v2.schema is not None and v.schema != v2.schema:
                         raise ValueError(f"Disagreement on schema for {k} in {self.filename}")
                     v2.schema = v.schema = v.schema or v2.schema
@@ -502,30 +528,6 @@ class PipelineStaging:
             repos={param_name: self._get_repo(sat_name) for param_name, sat_name in imp.repos.items()},
             executors={param_name: self._get_executor(sat_name) for param_name, sat_name in imp.executors.items()},
         )
-
-    def _get_priority(self, task: str, job: str, replica: int) -> float:
-        result = 0.0
-
-        for child in self._iter_children():
-            for directive in child.spec.priorities:
-                if (directive.job is None or directive.job == job) and (
-                    directive.task is None or directive.task == task
-                ):
-                    result += directive.priority
-            if task in child.spec.tasks:
-                result += child.spec.tasks[task].priority
-                addend = child.spec.tasks[task].priority_addend
-                factor = child.spec.tasks[task].priority_factor
-                if addend is not None:
-                    assert addend >= 0, "Priority addend must be >= 0"
-                    result -= addend * replica
-                if factor is not None:
-                    assert 0 < factor <= 1, "Priority factor must be 0 < x <= 1"
-                    if result < 0:
-                        result /= factor**replica
-                    else:
-                        result *= factor**replica
-        return result
 
     def missing(self, parent_name: Optional[str] = None) -> PipelineChildArgsMissing:
         """Return a PipelineChildArgsMissing instance for this pipeline.yaml file.
@@ -626,10 +628,69 @@ class PipelineStaging:
         root_hosts = {name: host_constructor(nameit(asdict(val), name)) for name, val in self.spec.hosts.items()}
         mjq = None if self.spec.max_job_quota is None else quota_constructor(self.spec.max_job_quota)
         assert mjq is None or isinstance(mjq, Quota)
-        return Pipeline(
+
+        pipeline = None
+        async def _get_priority(task: str, job: str, replica: int) -> float:
+            result = 0.0
+
+            for child in self._iter_children():
+                for directive in child.spec.priorities:
+                    if (directive.job is None or directive.job == job) and (
+                        directive.task is None or directive.task == task
+                    ):
+                        result += directive.priority
+                if task in child.spec.tasks:
+                    task_prio = 0
+                    try:
+                        task_prio = child.spec.tasks[task].priority
+                        if isinstance(task_prio, str):
+                            task_prio = await Task.render_template_cached(pipeline.tasks[task], task_prio, job, 0, {})
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        task_prio = 0
+                    result += float(task_prio)
+
+                    addend = 1
+                    try:
+                        addend = child.spec.tasks[task].priority_addend
+                        if isinstance(addend, str):
+                            addend = await Task.render_template_cached(pipeline.tasks[task], addend, job, 0, {})
+                            addend = float(addend)
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        addend = 1
+
+                    factor = child.spec.tasks[task].priority_factor
+                    function = child.spec.tasks[task].priority_function
+                    try:
+                        if function is not None:
+                            prio = get_priority_function(function)
+                            addend2 = await prio(pipeline, task, job, replica)
+                            assert addend2 >= 0, "Priority addend from custom function must be >= 0"
+                            result -= addend2 * (replica + 1)
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        result -= 1
+
+                    if addend is not None:
+                        assert addend >= 0, "Priority addend must be >= 0"
+                        result -= addend * replica
+                    if factor is not None:
+                        assert 0 < factor <= 1, "Priority factor must be 0 < x <= 1"
+                        if result < 0:
+                            result /= factor**replica
+                        else:
+                            result *= factor**replica
+
+            return result
+
+        pipeline = Pipeline(
             all_tasks,
             session,
-            self._get_priority,
+            _get_priority,
             agent_port=self.spec.agent_port,
             agent_hosts={
                 root_hosts[name] if name is not None else None: val for name, val in self.spec.agent_hosts.items()
@@ -646,6 +707,7 @@ class PipelineStaging:
             global_script_env=global_script_env,
             max_job_quota=mjq,
         )
+        return pipeline
 
     def allocate(
         self,
