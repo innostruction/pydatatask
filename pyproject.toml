@@ -50,7 +50,6 @@ dependencies = [
     "janus",
     "aiojobs",
     "orjson",
-    "crs-telemetry",
 ]
 
 [project.scripts]

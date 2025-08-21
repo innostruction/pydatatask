@@ -64,9 +64,6 @@ from aiohttp import web
 from networkx.drawing.nx_pydot import write_dot
 import aiofiles
 import uvloop
-from crs_telemetry.utils import get_otel_tracer, init_otel
-from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
-from opentelemetry.instrumentation.aiohttp_server import AioHttpServerInstrumentor
 
 from . import repository as repomodule
 from . import task as taskmodule
@@ -83,9 +80,6 @@ try:
 except ModuleNotFoundError:
     fuse = None  # type: ignore[assignment]
 
-init_otel("pydatatask", "infra", "pydatatask")
-tracer = get_otel_tracer()
-logging.getLogger("opentelemetry.attributes").disabled = True
 
 log = logging.getLogger(__name__)
 token_re = re.compile(r"\w+(?:\.\w+)+")
@@ -416,7 +410,6 @@ async def graph(pipeline: Pipeline, out_dir: Optional[Path]):
         write_dot(pipeline.graph, f)
 
 
-@tracer.start_as_current_span("pydatatask.http_agent")
 def http_agent(
     pipeline: Pipeline, host: str, override_port: Optional[int] = None, flush_seconds: Optional[float] = None, state_dir: Optional[str] = None, nginx_url: Optional[str] = None
 ) -> None:
@@ -425,7 +418,6 @@ def http_agent(
     web.run_app(app, host=host, port=override_port or pipeline.agent_port)
 
 
-@tracer.start_as_current_span("pydatatask.http_agent_multi")
 def http_agent_multi(pipeline: Pipeline, host: str, count: int) -> None:
     nginx = shutil.which("nginx")
     if nginx is None:
@@ -497,7 +489,6 @@ http {{
         raise Exception("nginx failed to start")
 
 
-@tracer.start_as_current_span("pydatatask.run")
 async def run(
     pipeline: Pipeline,
     forever: bool,
@@ -783,7 +774,6 @@ async def cat_data(pipeline: Pipeline, data: str, job: str):
         return 1
 
 
-@tracer.start_as_current_span("pydatatask.inject_data")
 async def inject_data(pipeline: Pipeline, data: str, job: str):
     item = lookup_dotted(pipeline, data)
     if isinstance(item, taskmodule.Task):
@@ -804,7 +794,6 @@ async def inject_data(pipeline: Pipeline, data: str, job: str):
         return 1
 
 
-@tracer.start_as_current_span("pydatatask.launch")
 async def launch(
     pipeline: Pipeline,
     task_name: str,
@@ -823,7 +812,6 @@ async def launch(
         return 1
 
 
-@tracer.start_as_current_span("pydatatask.action_backup")
 async def action_backup(
     pipeline: Pipeline, backup_dir: str, repos: List[str], all_repos: bool = False, shallow: bool = False
 ):

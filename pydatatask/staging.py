@@ -55,7 +55,7 @@ else:
     def _reprocess(value, ty):
         if isinstance(ty, ForwardRef):
             try:
-                ty = ty._evaluate(globals(), locals(), set())
+                ty = ty._evaluate(globals(), locals(), recursive_guard=set())
             except TypeError:
                 ty = ty._evaluate(globals(), locals())
         if is_dataclass(ty) and isinstance(value, dict):
