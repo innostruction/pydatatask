@@ -428,7 +428,7 @@ class KubeContainerManager(AbstractContainerManager):
                 {
                     "name": "main",
                     "image": full_image,
-                    "imagePullPolicy": "IfNotPresent",
+                    "imagePullPolicy": "Always",
                     "command": entrypoint,
                     "args": [cmd],
                     "env": [{"name": name, "value": value} for name, value in environ.items()]

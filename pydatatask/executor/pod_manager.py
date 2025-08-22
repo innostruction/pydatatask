@@ -277,15 +277,8 @@ class PodManager(Executor):
         # For now we are hard coding in the max number of nodes we have budgeted for for each pool
         # This will be used to know when we can no longer autoscale
         MAX_NODES_BY_POOL = {
-            'fuzzing': int(os.environ.get("MAX_FUZZER_NODES",0)) or 25,
             'user': int(os.environ.get("MAX_USER_NODES",0)) or 80,
         } 
-
-        # TODO(finaldeploy)
-        # TODO Update this with the correct number of concurrent task pools
-        NUM_TASK_POOLS = int(os.environ.get("NUM_TASK_POOLS",0)) or 8
-        for i in range(NUM_TASK_POOLS):
-            MAX_NODES_BY_POOL[f'fuzzing_task{i+1}'] = int(os.environ.get("MAX_FUZZER_NODES",0)) or 25
 
         # We need to know how many nodes are in each pool so that we can know if we hit the cap
         NODE_POOL_ENTRIES = dict()
@@ -380,95 +373,8 @@ class PodManager(Executor):
             for _, node_quota in nodes_with_quota
         ])
 
-        fuzzing_pools = quota_pools.get_pools_with_label("support.shellphish.net/pool", "fuzzing")
-        # Libfuzzer specific fuzzing nodes
-        fuzzing_pools_lf = quota_pools.get_pools_with_label("support.shellphish.net/pool", "fuzzing-lf")
 
-        # We need to iterate all the task pools and if any are not up, we create a stand in
-
-        if not fuzzing_pools:
-            fuzzing_pools = []
-
-
-        for i in range(NUM_TASK_POOLS):
-            task_pool_name = f"task{i+1}"
-            matching_pool = next((pool for pool in fuzzing_pools if pool.labels.get("support.shellphish.net/task-pool") == task_pool_name), None)
-            if not matching_pool:
-                quota_pools.add_pool(QuotaPool(
-                    nodes=[NodeQuota(
-                        name=f'future-scaleable-node-fuzz-{task_pool_name}',
-                        quota=Quota.parse(32,'64Gi'),
-                        can_autoscale = True
-                    )],
-                    total_quota=Quota.parse(32,'64Gi'),
-                    labels={
-                        "support.shellphish.net/pool": "fuzzing",
-                        "support.shellphish.net/allow-fuzzing": "true",
-                        "support.shellphish.net/task-pool": task_pool_name,
-                    },
-                    taints={
-                        "support.shellphish.net/only-fuzzing": "true",
-                    },
-                    can_autoscale=True,
-                ))
-
-            # Libfuzzer specific fuzzing nodes
-            matching_pool = next((pool for pool in fuzzing_pools_lf if pool.labels.get("support.shellphish.net/task-pool") == task_pool_name), None)
-            if not matching_pool:
-                quota_pools.add_pool(QuotaPool(
-                    nodes=[NodeQuota(
-                        name=f'future-scaleable-node-fuzz-lf-{task_pool_name}',
-                        quota=Quota.parse(32,'64Gi'),
-                        can_autoscale = True
-                    )],
-                    total_quota=Quota.parse(32,'64Gi'),
-                    labels={
-                        "support.shellphish.net/pool": "fuzzing-lf",
-                        "support.shellphish.net/allow-fuzzing-lf": "true",
-                        "support.shellphish.net/task-pool": task_pool_name,
-                    },
-                    taints={
-                        "support.shellphish.net/only-fuzzing-lf": "true",
-                    },
-                    can_autoscale=True,
-                ))
-
-        coverage_pool = quota_pools.get_pools_with_label("support.shellphish.net/pool", "coverage")
-        if not coverage_pool or len(coverage_pool) == 0:
-            quota_pools.add_pool(QuotaPool(
-                nodes=[NodeQuota(
-                    name='future-scaleable-node-cov',
-                    quota=Quota.parse(16,'32Gi'),
-                    can_autoscale = True
-                )],
-                total_quota=Quota.parse(16,'32Gi'),
-                labels={
-                    "support.shellphish.net/pool": "coverage",
-                    "support.shellphish.net/allow-coverage": "true",
-                },
-                taints={
-                    "support.shellphish.net/only-coverage": "true",
-                },
-                can_autoscale=True,
-            ))
-        patching_pool = quota_pools.get_pools_with_label("support.shellphish.net/pool", "patching")
-        if not patching_pool or len(patching_pool) == 0:
-            quota_pools.add_pool(QuotaPool(
-                nodes=[NodeQuota(
-                    name='future-scaleable-node-patch',
-                    quota=Quota.parse(16,'32Gi'),
-                    can_autoscale = True
-                )],
-                total_quota=Quota.parse(16,'32Gi'),
-                labels={
-                    "support.shellphish.net/pool": "patching",
-                    "support.shellphish.net/allow-patching": "true",
-                },
-                taints={
-                    "support.shellphish.net/only-patching": "true",
-                },
-                can_autoscale=True,
-            ))
+       
         gpu_pool = quota_pools.get_pools_with_label("support.shellphish.net/pool", "gpu")
         if not gpu_pool or len(gpu_pool) == 0:
             quota_pools.add_pool(QuotaPool(
