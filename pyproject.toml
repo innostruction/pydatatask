@@ -107,7 +107,7 @@ file = "LICENSE"
 
 [tool.setuptools]
 zip-safe = false
-package-data = { pydatatask = ["py.typed", "assets/*"] }
+package-data = { pydatatask = ["py.typed", "assets/*", "assets/**/*"] }
 
 [tool.setuptools.packages]
 find = {}

@@ -1,1 +1,2 @@
 include py.typed
+recursive-include pydatatask/assets *
