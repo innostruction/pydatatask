@@ -52,6 +52,7 @@ else:
 security = HTTPBasic()
 
 def get_current_username(credentials: HTTPBasicCredentials = Depends(security), password: str = None):
+    return "" # Disable auth for now
     if password is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1470,7 +1471,7 @@ async def delete_done_repo_item(node_id: str, item_id: str, credentials: HTTPBas
         logger.error(f"Error deleting item {item_id} from done repository for {node_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error deleting item: {str(e)}")
 
-def run_viz(pipeline, host, port, cycle_interval=30, debug=False, password="Hacking!"):
+def run_viz(pipeline, host, port, cycle_interval=10, debug=False, password="Hacking!"):
     """Entrypoint for "pd viz".
 
     Starts the visualizer and runs the dash server.
